@@ -48,6 +48,7 @@ from verl.utils.model import load_mcore_dist_weights, load_megatron_gptmodel_wei
 from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+from verl.workers.sharding_manager.hybrid_tp_config import HybridTPConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -269,6 +270,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             from verl.models.mcore import get_mcore_weight_converter
 
             weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
+            # create HybridTPConfig
+            hybrid_tp_config = HybridTPConfig.from_dict_config(
+                self.config.rollout.get("hybrid_tp", {}),
+                self.config.rollout.tensor_model_parallel_size
+            )
+            
             sharding_manager = MegatronVLLMShardingManager(
                 inference_engine=rollout.inference_engine,
                 model_config=self.actor_model_config,
@@ -278,6 +285,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 weight_converter=weight_converter,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                bridge=self.bridge,
+                hybrid_tp_config=hybrid_tp_config,
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
