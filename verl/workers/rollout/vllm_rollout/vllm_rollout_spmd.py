@@ -47,6 +47,7 @@ from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.sharding_manager.hybrid_tp_config import HybridTPConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -154,7 +155,11 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+
+        # Extract hybrid_tp_config from kwargs if provided
+        self.hybrid_tp_config = kwargs.pop("hybrid_tp_config", None)
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
@@ -214,6 +219,21 @@ class vLLMRollout(BaseRollout):
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
         _init_dp_envs(config)
+        # Extract hybrid TP config for additional_config
+        additional_config = {}
+        if hasattr(self, 'hybrid_tp_config') and self.hybrid_tp_config is not None:
+            # Extract tp_size values from hybrid_tp_config
+            if self.hybrid_tp_config.o_proj_tp_size is not None:
+                additional_config["o_proj_tp_size"] = self.hybrid_tp_config.o_proj_tp_size
+            if self.hybrid_tp_config.mlp_tp_size is not None:
+                additional_config["mlp_tp_size"] = self.hybrid_tp_config.mlp_tp_size
+            if self.hybrid_tp_config.lm_head_tp_size is not None:
+                additional_config["lm_head_tp_size"] = self.hybrid_tp_config.lm_head_tp_size
+        
+        # Add additional_config to engine_kwargs if not empty
+        if additional_config:
+            engine_kwargs["additional_config"] = additional_config
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
@@ -466,6 +486,53 @@ class vLLMAsyncRollout:
         self.inference_engine: WorkerWrapperBase = None
         self.sharding_manager = None
         self.is_sleep = False
+
+        self.address = self._init_zeromq()
+        
+        # Extract hybrid_tp_config from kwargs if provided
+        self.hybrid_tp_config = kwargs.pop("hybrid_tp_config", None)
+
+    def _init_zeromq(self) -> str:
+        tensor_parallel_size = self.config.tensor_model_parallel_size
+
+        # single node: ipc, multi nodes: tcp
+        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        socket_type = "ipc" if tensor_parallel_size <= local_world_size else "tcp"
+
+        # File lock to prevent multiple workers listen to same port
+        with FileLock("/tmp/verl_vllm_zmq.lock"):
+            if socket_type == "ipc":
+                pid = os.getpid()
+                address = f"ipc:///tmp/verl_vllm_zmq_{pid}.ipc"
+            else:
+                ip, port = self._get_free_port()
+                address = f"tcp://{ip}:{port}"
+            context = zmq.Context()
+            self.socket = context.socket(zmq.REP)
+            self.socket.bind(address)
+
+        self.loop_thread = threading.Thread(target=self._loop_forever)
+        self.loop_thread.start()
+
+        return address
+
+    def _get_free_port(self):
+        ip = ray._private.services.get_node_ip_address()
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        return ip, port
+
+    def _loop_forever(self):
+        while True:
+            message = self.socket.recv()
+            method, args, kwargs = pickle.loads(message)
+            result = self.execute_method(method, *args, **kwargs)
+            self.socket.send(pickle.dumps(result))
+
+    def get_zeromq_address(self):
+        return self.address
+
 
     def init_worker(self, all_kwargs: List[Dict[str, Any]]):
         """Initialize worker engine."""

@@ -245,12 +245,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("Before building vllm rollout", logger=None)
 
             local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+
+            # create HybridTPConfig
+            hybrid_tp_config = HybridTPConfig.from_dict_config(
+                self.config.rollout.get("hybrid_tp", {}),
+                self.config.rollout.tensor_model_parallel_size
+            )
+
             if vllm_mode == "customized":
                 rollout = vLLMRollout(
                     actor_module=self.actor_module,
                     config=self.config.rollout,
                     tokenizer=self.tokenizer,
                     model_hf_config=self.actor_model_config,
+                    hybrid_tp_config=hybrid_tp_config,
                 )
             elif vllm_mode == "spmd":
                 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
@@ -263,18 +271,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     model_hf_config=self.actor_model_config,
                     device_mesh=rollout_device_mesh,
                     trust_remote_code=trust_remote_code,
+                    hybrid_tp_config=hybrid_tp_config,
                 )
+
             log_gpu_memory_usage("After building vllm rollout", logger=logger)
 
             # perform weight resharding between actor and rollout
             from verl.models.mcore import get_mcore_weight_converter
 
             weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
-            # create HybridTPConfig
-            hybrid_tp_config = HybridTPConfig.from_dict_config(
-                self.config.rollout.get("hybrid_tp", {}),
-                self.config.rollout.tensor_model_parallel_size
-            )
+
             
             sharding_manager = MegatronVLLMShardingManager(
                 inference_engine=rollout.inference_engine,
@@ -594,6 +600,12 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         self.vllm_tp_size = self.config.rollout.tensor_model_parallel_size
         self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
         self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
+
+        # Save hybrid_tp_config for AsyncvLLMServer
+        self.hybrid_tp_config = HybridTPConfig.from_dict_config(
+            self.config.rollout.get("hybrid_tp", {}),
+            self.config.rollout.tensor_model_parallel_size
+        )
 
         # used for sleep/wake_up
         rollout.sharding_manager = rollout_sharding_manager
