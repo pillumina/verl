@@ -73,6 +73,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.profiler.performance import reduce_timing
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.sharding_manager.hybrid_tp_config import HybridTPConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -511,6 +512,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
             full_params = torch.distributed.get_world_size() == 1
+            # create HybridTPConfig
+            hybrid_tp_config = HybridTPConfig.from_dict_config(
+                self.config.rollout.get("hybrid_tp", {}),
+                self.config.rollout.tensor_model_parallel_size
+            )
+            
             rollout_sharding_manager = FSDPVLLMShardingManager(
                 module=self.actor_module_fsdp,
                 inference_engine=rollout.inference_engine,
@@ -521,6 +528,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_param=self._is_offload_param,
                 load_format=self.config.rollout.load_format,
                 layered_summon=self.config.rollout.get("layered_summon", False),
+                hybrid_tp_config=hybrid_tp_config,
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 

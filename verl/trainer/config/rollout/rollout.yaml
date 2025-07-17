@@ -193,3 +193,25 @@ agent:
 
     # Class name of the custom async server class (e.g. AsyncvLLMServer)
     name: null
+
+# [Experimental] Hybrid TP configuration for Qwen models
+hybrid_tp:
+
+  # Whether to enable hybrid TP strategy
+  enabled: false
+
+  # TP size for o_proj layer (attention output projection)
+  # null means follow external tensor_model_parallel_size
+  o_proj_tp_size: null
+
+  # TP size for MLP layers (gate_proj, up_proj, down_proj)
+  # null means follow external tensor_model_parallel_size
+  mlp_tp_size: null
+
+  # TP size for lm_head layer
+  # null means follow external tensor_model_parallel_size
+  lm_head_tp_size: null
+
+  # Custom layer name mappings for non-standard models
+  # Format: {"original_layer_name": "standard_layer_name"}
+  custom_layer_mappings: {}
