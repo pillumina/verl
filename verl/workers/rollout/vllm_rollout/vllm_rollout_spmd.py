@@ -54,6 +54,7 @@ from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.sharding_manager.hybrid_tp_config import HybridTPConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -87,6 +88,9 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        
+        # Extract hybrid_tp_config from kwargs if provided
+        self.hybrid_tp_config = kwargs.pop("hybrid_tp_config", None)
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
@@ -161,6 +165,21 @@ class vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+
+        # Extract hybrid TP config for additional_config
+        additional_config = {}
+        if hasattr(self, 'hybrid_tp_config') and self.hybrid_tp_config is not None:
+            # Extract tp_size values from hybrid_tp_config
+            if self.hybrid_tp_config.o_proj_tp_size is not None:
+                additional_config["o_proj_tp_size"] = self.hybrid_tp_config.o_proj_tp_size
+            if self.hybrid_tp_config.mlp_tp_size is not None:
+                additional_config["mlp_tp_size"] = self.hybrid_tp_config.mlp_tp_size
+            if self.hybrid_tp_config.lm_head_tp_size is not None:
+                additional_config["lm_head_tp_size"] = self.hybrid_tp_config.lm_head_tp_size
+        
+        # Add additional_config to engine_kwargs if not empty
+        if additional_config:
+            engine_kwargs["additional_config"] = additional_config
 
         self.inference_engine = LLM(
             model=model_path,
@@ -414,6 +433,9 @@ class vLLMAsyncRollout:
         self.sharding_manager = None
         self.is_sleep = False
         self.address = self._init_zeromq()
+        
+        # Extract hybrid_tp_config from kwargs if provided
+        self.hybrid_tp_config = kwargs.pop("hybrid_tp_config", None)
 
     def _init_zeromq(self) -> str:
         tensor_parallel_size = self.config.tensor_model_parallel_size

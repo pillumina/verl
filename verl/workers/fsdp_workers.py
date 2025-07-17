@@ -499,6 +499,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # lora_kwargs = {}
             from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 
+            # create HybridTPConfig first
+            hybrid_tp_config = HybridTPConfig.from_dict_config(
+                self.config.rollout.get("hybrid_tp", {}),
+                self.config.rollout.tensor_model_parallel_size
+            )
+
+            # todo: async rollout scenario ain't fully supported
             vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
             rollout = vllm_rollout_cls(
                 model_path=local_path,
@@ -507,16 +514,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_hf_config=self.actor_model_config,
                 device_mesh=rollout_device_mesh,
                 trust_remote_code=trust_remote_code,
+                hybrid_tp_config=hybrid_tp_config,
                 **lora_kwargs,
             )
 
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
             full_params = torch.distributed.get_world_size() == 1
-            # create HybridTPConfig
-            hybrid_tp_config = HybridTPConfig.from_dict_config(
-                self.config.rollout.get("hybrid_tp", {}),
-                self.config.rollout.tensor_model_parallel_size
-            )
             
             rollout_sharding_manager = FSDPVLLMShardingManager(
                 module=self.actor_module_fsdp,
@@ -1668,6 +1671,12 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
         self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
 
+        # Save hybrid_tp_config for AsyncvLLMServer
+        self.hybrid_tp_config = HybridTPConfig.from_dict_config(
+            self.config.rollout.get("hybrid_tp", {}),
+            self.config.rollout.tensor_model_parallel_size
+        )
+
         # used for sleep/wake_up
         rollout.sharding_manager = rollout_sharding_manager
 
@@ -1713,3 +1722,8 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
             await self.rollout.sleep()
         # return something to block the caller
         return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_hybrid_tp_config(self):
+        """Get hybrid TP configuration for AsyncvLLMServer."""
+        return self.hybrid_tp_config

@@ -35,6 +35,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
+from verl.workers.sharding_manager.hybrid_tp_config import HybridTPConfig
 
 logger = logging.getLogger(__file__)
 
@@ -190,13 +191,14 @@ class AsyncvLLMServer(AsyncServerBase):
     For vLLM AsyncLLM design, see: https://github.com/vllm-project/vllm/pull/9826
     """
 
-    def __init__(self, config: DictConfig, vllm_dp_size: int, vllm_dp_rank: int, wg_prefix: str):
+    def __init__(self, config: DictConfig, vllm_dp_size: int, vllm_dp_rank: int, wg_prefix: str, hybrid_tp_config=None):
         """
         Args:
             config: DictConfig.
             vllm_dp_size: int, vllm data parallel size.
             vllm_dp_rank: int, vllm data parallel rank.
             wg_prefix: str, worker group prefix, used to lookup actors.
+            hybrid_tp_config: HybridTPConfig, hybrid tensor parallel configuration.
         """
         super().__init__()
 
@@ -204,6 +206,7 @@ class AsyncvLLMServer(AsyncServerBase):
         self.vllm_dp_size = vllm_dp_size
         self.vllm_dp_rank = vllm_dp_rank
         self.wg_prefix = wg_prefix
+        self.hybrid_tp_config = hybrid_tp_config
         self.engine: AsyncLLM = None
 
     async def init_engine(self):
@@ -241,6 +244,17 @@ class AsyncvLLMServer(AsyncServerBase):
         else:
             distributed_executor_backend = None
 
+        # Extract hybrid TP config for additional_config
+        additional_config = {}
+        if hasattr(self, 'hybrid_tp_config') and self.hybrid_tp_config is not None:
+            # Extract tp_size values from hybrid_tp_config
+            if self.hybrid_tp_config.o_proj_tp_size is not None:
+                additional_config["o_proj_tp_size"] = self.hybrid_tp_config.o_proj_tp_size
+            if self.hybrid_tp_config.mlp_tp_size is not None:
+                additional_config["mlp_tp_size"] = self.hybrid_tp_config.mlp_tp_size
+            if self.hybrid_tp_config.lm_head_tp_size is not None:
+                additional_config["lm_head_tp_size"] = self.hybrid_tp_config.lm_head_tp_size
+
         engine_args = AsyncEngineArgs(
             model=local_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -260,6 +274,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            additional_config=additional_config if additional_config else None,
         )
 
         # init async llm engine
