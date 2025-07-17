@@ -144,6 +144,15 @@ class HybridTPConfig:
             return self.lm_head_tp_size
         else:
             return self.external_tp_size
+        
+    def get_tp_size_for_layer_type(self, layer_type: str) -> int:
+        """Get tp size for layer type"""
+        size_map = {
+            "attention_output": self.o_proj_tp_size,
+            "mlp": self.mlp_tp_size,
+            "lm_head": self.lm_head_tp_size
+        }
+        return size_map.get(layer_type) or self.external_tp_size
     
     def is_hybrid_enabled(self) -> bool:
         """Check if hybrid TP is enabled and at least one layer has different TP size."""
