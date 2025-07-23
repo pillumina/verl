@@ -18,6 +18,7 @@ This file contains a Megatron style Hybrid Engine that shares the weights of the
 import inspect
 import logging
 import os
+from typing import Optional,List,Tuple
 
 import torch
 import torch.distributed
@@ -41,6 +42,8 @@ from verl.utils.torch_functional import check_device_is_available
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
 from .base import BaseShardingManager
+from .hybrid_tp_config import HybridTPConfig
+from .hybrid_tp_processor import HybridTPProcessor
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -69,6 +72,8 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         weight_converter: McoreToHFWeightConverterBase,
         device_mesh,
         offload_param: bool = True,
+        bridge=None,
+        hybrid_tp_config: Optional[HybridTPConfig] = None
     ):
         self.actor_module = actor_module
         self.inference_engine = inference_engine
@@ -86,6 +91,16 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         self.transformer_config = transformer_config
         self.layer_name_mapping = layer_name_mapping
         self.weight_converter = weight_converter
+        self.bridge = bridge
+        self.hybrid_tp_config = hybrid_tp_config
+        # if self.hybrid_tp_config:
+        #     self.hybrid_tp_config.validate()
+        #     if self.hybrid_tp_config.is_hybrid_enabled():
+        #         self.hybrid_tp_processor = HybridTPProcessor(
+        #             self.hybrid_tp_config, model_config
+        #         )
+        #         logger.info(f"Initialized hybrid TP processor for {self.hybrid_tp_processor.model_type}")
+
         # initialize groups for vllm inference
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
@@ -149,6 +164,10 @@ class MegatronVLLMShardingManager(BaseShardingManager):
                 loaded_params = model.load_weights(per_tensor_param)
                 info = f"vLLM load weights, loaded_params: {len(loaded_params)}"
                 logger.info(info)
+            # Apply hybrid TP resharding if enabled
+            # if hasattr(self, 'hybrid_tp_config') and self.hybrid_tp_config and self.hybrid_tp_config.is_hybrid_enabled():
+            #     per_tensor_param = self.apply_hybrid_tp_resharding(per_tensor_param)
+            
 
             if self.offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
@@ -180,6 +199,26 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+
+    # @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
+    # def apply_hybrid_tp_resharding(self, per_tensor_param) -> List[Tuple[str, torch.Tensor]]:
+    #     """Apply Hybrid tp for megatron model"""
+    #     if not self.hybrid_tp_config or not self.hybrid_tp_config.is_hybrid_enabled():
+    #         return per_tensor_param
+        
+    #     logger.info(f"Applying hybrid TP for {self.hybrid_tp_processor.model_type} Megatron model")
+        
+    #     # gather all parameter
+    #     all_params = list(per_tensor_param)
+        
+    #     # convert to dict type for processing
+    #     weights_dict = {name: param for name, param in all_params}
+    #     processed_weights = self.hybrid_tp_processor.apply_hybrid_tp(weights_dict)
+        
+    #     # convert back to list type
+    #     result = [(name, param) for name, param in processed_weights.items()]
+        
+    #     return result
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
     def preprocess_data(self, data: DataProto) -> DataProto:
