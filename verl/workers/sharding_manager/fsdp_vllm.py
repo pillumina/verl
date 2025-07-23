@@ -16,8 +16,10 @@ import inspect
 import logging
 import os
 import time
+from typing import Optional, Dict
 from collections import OrderedDict
 
+import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -47,6 +49,8 @@ from verl.utils.torch_functional import check_device_is_available
 from verl.utils.vllm_utils import TensorLoRARequest, VLLMHijack, is_version_ge, patch_vllm_moe_model_weight_loader
 
 from .base import BaseShardingManager
+from .hybrid_tp_config import HybridTPConfig
+from .hybrid_tp_processor import HybridTPProcessor
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -72,6 +76,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         offload_param: bool = False,
         load_format: str = "dummy_hf",
         layered_summon: bool = True,
+        hybrid_tp_config: Optional[HybridTPConfig] = None
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer initialized in vLLMAsyncRollout.load_model
@@ -91,6 +96,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.offload_param = offload_param
         self.load_format = load_format
         self.layered_summon = layered_summon
+        self.hybrid_tp_config = hybrid_tp_config
+        # if self.hybrid_tp_config:
+        #     self.hybrid_tp_config.validate()
+        #     if self.hybrid_tp_config.is_hybrid_enabled():
+        #         self.hybrid_tp_processor = HybridTPProcessor(
+        #             self.hybrid_tp_config, model_config
+        #         )
+        #         logger.info(f"Initialized hybrid TP processor for {self.hybrid_tp_processor.model_type}")
 
         # Full params
         self.full_params = full_params
@@ -207,6 +220,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
+            # hybrid tp resharding
+            # # Apply hybrid TP resharding if enabled
+            # if hasattr(self, 'hybrid_tp_config') and self.hybrid_tp_config and self.hybrid_tp_config.is_hybrid_enabled():           
+            #     params = self.apply_hybrid_tp_resharding(params)
+
             if self.rollout_config.free_cache_engine:
                 if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                     self.inference_engine.wake_up(tags=["weights"])
@@ -248,6 +266,17 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+
+
+    # @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
+    # def apply_hybrid_tp_resharding(self, params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    #     """Apply hybrid tp resharding"""
+    #     if not self.hybrid_tp_config or not self.hybrid_tp_config.is_hybrid_enabled():
+    #         return params
+        
+    #     logger.info(f"Applying hybrid TP for {self.hybrid_tp_processor.model_type} FSDP model")
+        
+    #     return self.hybrid_tp_processor.apply_hybrid_tp(params)
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def preprocess_data(self, data: DataProto) -> DataProto:
