@@ -61,10 +61,10 @@ gen_tp=2
 gen_dp=8
 gen_world_size=16 # nnodes* npus_in_per_node
 
-train_tp=4
+train_tp=8
 train_ep=2
 train_pp=2
-train_cp=2
+train_cp=1
 
 
 # hybrid tp 
@@ -74,8 +74,9 @@ hybrid_tp_enable=True
 lm_head_tp_size=${train_tp}
 
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    -- python3 -m recipe.dapo.main_dapo \
+#ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+ #   -- 
+python3 -m recipe.dapo.main_dapo \
     --config-name="dapo_trainer-megatron" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
