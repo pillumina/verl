@@ -61,7 +61,7 @@ gen_tp=2
 gen_dp=8
 gen_world_size=16 # nnodes* npus_in_per_node
 
-train_tp=8
+train_tp=4
 train_ep=2
 train_pp=2
 train_cp=1
@@ -134,8 +134,8 @@ python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.hybrid_tp.enabled=${hybrid_tp_enable} \
-    actor_rollout_ref.rollout.hybrid_tp.lm_head_tp_size=${lm_head_tp_size} \
+    +actor_rollout_ref.rollout.hybrid_tp.enabled=${hybrid_tp_enable} \
+    +actor_rollout_ref.rollout.hybrid_tp.lm_head_tp_size=${lm_head_tp_size} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep} \
