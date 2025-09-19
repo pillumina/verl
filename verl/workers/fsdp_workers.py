@@ -148,6 +148,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
 
+        # Initialize tensor cache for D2D optimization (FSDP version)
+        self.d2d_enabled = os.getenv("D2D_DATA_TRANSFER", "false").lower() == "true"
+        if self.d2d_enabled:
+            from verl.tensor_cache import TensorCache
+            self.tensor_cache = TensorCache(config=self.config, parallel_mode="fsdp")
+            logger.info("D2D data transfer enabled via tensor cache (FSDP mode)")
+
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
 
@@ -681,6 +688,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+        # D2D optimization: retrieve cached tensors from tensor cache
+        if self.d2d_enabled:
+            try:
+                keys_to_get = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask", 
+                              "rollout_log_probs", "ref_log_prob"]
+                cached_tensors = self.tensor_cache.get_cached_tensors(data, keys_to_get)
+                
+                if cached_tensors:
+                    data = data.union(cached_tensors)
+                    logger.info(f"D2D (FSDP): Retrieved {len(cached_tensors.batch)} cached tensors for actor update")
+            except Exception as e:
+                logger.warning(f"D2D (FSDP): Failed to retrieve cached tensors for actor update: {e}")
+        
         # Support all hardwares
         data = data.to(get_device_id())
 
@@ -722,6 +742,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        # D2D optimization: clear cache after training completion
+        if self.d2d_enabled:
+            self.tensor_cache.clear()
+            logger.info("D2D (FSDP): Cleared tensor cache after actor training completed")
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -758,8 +783,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # to make sure meta_info["timing"] is the same
         timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
-        output = output.to("cpu")
 
+        # D2D optimization: cache core tensors for subsequent D2D transfer
+        if self.d2d_enabled:
+            keys_to_reserve = ["responses", "attention_mask"]
+            keys_no_cache = ["prompts"]
+            
+            all_keys_before_cache = list(output.batch.keys())
+            
+            self.tensor_cache.cache_tensors(
+                data=output,
+                keys_to_reserve=keys_to_reserve,
+                keys_no_cache=keys_no_cache
+            )
+            
+            # Statistics logging
+            reserved_keys = [k for k in keys_to_reserve if k in all_keys_before_cache]
+            no_cache_keys = [k for k in keys_no_cache if k in all_keys_before_cache]
+            cached_and_popped_keys = [k for k in all_keys_before_cache if k not in keys_to_reserve and k not in keys_no_cache]
+            logger.info(f"D2D (FSDP): Reserved for CPU: {reserved_keys}, No cache: {no_cache_keys}, Cached&Popped: {cached_and_popped_keys}")
+
+        output = output.to("cpu")
         # clear kv cache
         get_torch_device().empty_cache()
         return output
@@ -769,6 +813,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
+        # D2D optimization: retrieve cached tensors from tensor cache
+        if self.d2d_enabled:
+            try:
+                keys_to_get = ["input_ids", "attention_mask", "position_ids", "responses"] # remove response_mask
+                cached_tensors = self.tensor_cache.get_cached_tensors(data, keys_to_get)
+                
+                if cached_tensors:
+                    data = data.union(cached_tensors)
+                    logger.info(f"D2D (FSDP): Retrieved {len(cached_tensors.batch)} cached tensors for old log prob computation")
+            except Exception as e:
+                logger.warning(f"D2D (FSDP): Failed to retrieve cached tensors for old log prob computation: {e}")
+
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -795,6 +851,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
+            # Cache old_log_prob for update stage (before moving to CPU)
+        if self.d2d_enabled:
+            self.tensor_cache.cache_tensors(
+                data=output,  # 直接使用output，不需要重新创建
+                keys_to_reserve=["old_log_prob"],
+                keys_no_cache=[]
+            )
+            logger.info("D2D (FSDP): Cached old_log_prob tensor (reserved for CPU)")
+
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -811,12 +876,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        # D2D optimization: retrieve cached tensors from tensor cache
+        if self.d2d_enabled:
+            try:
+                keys_to_get = ["input_ids", "attention_mask", "position_ids", "responses"]
+                cached_tensors = self.tensor_cache.get_cached_tensors(data, keys_to_get)
+                
+                if cached_tensors:
+                    data = data.union(cached_tensors)
+                    logger.info(f"D2D (FSDP): Retrieved {len(cached_tensors.batch)} cached tensors for ref computation")
+            except Exception as e:
+                logger.warning(f"D2D (FSDP): Failed to retrieve cached tensors for ref computation: {e}")
+        
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
             data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            
+            # Cache ref_log_prob for update stage (before moving to CPU)
+            if self.d2d_enabled:
+                self.tensor_cache.cache_tensors(
+                    data=data,  # 直接使用data，不需要重新创建
+                    keys_to_reserve=["ref_log_prob"],
+                    keys_no_cache=[]
+                )
+                logger.info("D2D (FSDP): Cached ref_log_prob tensor (reserved for CPU)")
+            
             return data
         assert self._is_ref
         # else:
@@ -834,6 +921,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        # Cache ref_log_prob for update stage (before moving to CPU)
+        if self.d2d_enabled:
+            self.tensor_cache.cache_tensors(
+                data=output,  # 直接使用output，不需要重新创建
+                keys_to_reserve=["ref_log_prob"],
+                keys_no_cache=[]
+            )
+            logger.info("D2D (FSDP): Cached ref_log_prob tensor (reserved for CPU)")
 
         output = output.to("cpu")
 

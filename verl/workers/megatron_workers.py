@@ -213,6 +213,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
+        # Initialize tensor cache for D2D optimization (controlled by environment variable)
+        self.d2d_enabled = os.getenv("D2D_DATA_TRANSFER", "false").lower() == "true"
+        if self.d2d_enabled:
+            from verl.tensor_cache import TensorCache
+            self.tensor_cache = TensorCache(config=self.config)
+            logger.info("D2D data transfer enabled via tensor cache")
+
         profiler_config = omega_conf_to_dataclass(config.get("profiler"))
         DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=profiler_config))
 
@@ -582,6 +589,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+
+        # D2D optimization: retrieve cached tensors from tensor cache
+        if self.d2d_enabled:
+            try:
+                # Get all cached tensors needed for update stage (required for training)
+                keys_to_get = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask", 
+                              "rollout_log_probs", "ref_log_prob"]
+                cached_tensors = self.tensor_cache.get_cached_tensors(data, keys_to_get)
+                
+                if cached_tensors:
+                    # Use union to merge cached tensors into data
+                    data = data.union(cached_tensors)
+                    logger.info(f"D2D: Retrieved {len(cached_tensors.batch)} cached tensors for actor update")
+            except Exception as e:
+                logger.warning(f"D2D: Failed to retrieve cached tensors for actor update: {e}")
+
         data.batch = data.batch.to(get_device_name())
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
@@ -604,6 +627,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
+        
+        # D2D optimization: clear cache after training completion to free GPU memory
+        if self.d2d_enabled:
+            self.tensor_cache.clear()
+            logger.info("D2D: Cleared tensor cache after actor training completed")
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
@@ -647,6 +675,36 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # to make sure meta_info["timing"] is the same
         timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
+
+        # D2D optimization: cache core tensors for subsequent D2D transfer
+        if self.d2d_enabled:
+            # Data needed by CPU side (for reward computation etc.): keep in output and cache
+            # responses: need to be decoded to text for reward computation  
+            # attention_mask: need to determine valid length
+            # Note: prompts don't need to be sent back as CPU side already retains prompts in original batch
+            keys_to_reserve = ["responses", "attention_mask"]
+            
+            # Data needed by subsequent stages but not CPU: cache only, remove from output
+            # input_ids, position_ids, rollout_log_probs, response_mask will be automatically cached and popped
+            
+            # prompts not needed by subsequent stages, no need to cache, discard directly
+            keys_no_cache = ["prompts"]
+            
+            # Record all tensor keys before cache_tensors call, as it will be modified inplace
+            all_keys_before_cache = list(output.batch.keys())
+            
+            self.tensor_cache.cache_tensors(
+                data=output,
+                keys_to_reserve=keys_to_reserve,
+                keys_no_cache=keys_no_cache
+            )
+            
+            # Statistics of actual caching situation
+            reserved_keys = [k for k in keys_to_reserve if k in all_keys_before_cache]
+            no_cache_keys = [k for k in keys_no_cache if k in all_keys_before_cache]
+            cached_and_popped_keys = [k for k in all_keys_before_cache if k not in keys_to_reserve and k not in keys_no_cache]
+            logger.info(f"D2D: Reserved for CPU: {reserved_keys}, No cache: {no_cache_keys}, Cached&Popped: {cached_and_popped_keys}")
+
         output = output.to("cpu")
         # clear kv cache
         aggressive_empty_cache(force_sync=True)
@@ -660,6 +718,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
             log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
+        
+        # D2D optimization: retrieve cached tensors from tensor cache
+        if self.d2d_enabled:
+            try:
+                # Get tensors needed for ref computation
+                keys_to_get = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
+                cached_tensors = self.tensor_cache.get_cached_tensors(data, keys_to_get)
+                
+                if cached_tensors:
+                    # Use union to merge cached tensors into data
+                    data = data.union(cached_tensors)
+                    logger.info(f"D2D: Retrieved {len(cached_tensors.batch)} cached tensors for ref computation")
+            except Exception as e:
+                logger.warning(f"D2D: Failed to retrieve cached tensors for ref computation: {e}")
+        
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
@@ -667,6 +740,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
         output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        
+        # D2D optimization: cache ref_log_prob for subsequent use
+        if self.d2d_enabled:
+            # ref_log_prob needs to be returned to CPU (for statistics etc.) and cached for update stage
+            # Create temporary DataProto to cache ref_log_prob
+            ref_data = DataProto.from_dict(tensors={"ref_log_prob": output.clone()})
+            self.tensor_cache.cache_tensors(
+                data=ref_data,
+                keys_to_reserve=["ref_log_prob"],  # CPU needs it, so reserve and cache
+                keys_no_cache=[]
+            )
+            logger.info("D2D: Cached ref_log_prob tensor (reserved for CPU)")
+        
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:

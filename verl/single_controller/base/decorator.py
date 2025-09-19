@@ -171,8 +171,23 @@ def collect_dp_compute(worker_group, output):
 
 def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
+    import os
 
     assert isinstance(worker_group, WorkerGroup)
+    
+    # D2D optimization: automatically set global_dp_ranks for FSDP workers
+    if os.getenv("D2D_DATA_TRANSFER", "false").lower() == "true":
+        # For DP_COMPUTE_PROTO, we use simple rank mapping [0, 1, 2, ...]
+        dp_rank_mapping = list(range(worker_group.world_size))
+        
+        for arg in args:
+            if hasattr(arg, 'meta_info') and arg.meta_info is not None:
+                arg.meta_info["global_dp_ranks"] = dp_rank_mapping
+                
+        for key, val in kwargs.items():
+            if hasattr(val, 'meta_info') and val.meta_info is not None:
+                val.meta_info["global_dp_ranks"] = dp_rank_mapping
+    
     # Note: enable auto padding for dp compute DatapProto
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto_with_auto_padding(
         worker_group.world_size,
@@ -268,6 +283,7 @@ def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output)
 
 def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
+    import os
 
     assert isinstance(worker_group, WorkerGroup)
 
@@ -277,6 +293,17 @@ def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
         assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
 
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    
+    # D2D optimization: automatically set global_megatron_dp_ranks to all DataProto meta_info
+    if os.getenv("D2D_DATA_TRANSFER", "false").lower() == "true":
+        for arg in args:
+            if hasattr(arg, 'meta_info') and arg.meta_info is not None:
+                arg.meta_info["global_megatron_dp_ranks"] = dp_rank_mapping
+                
+        for key, val in kwargs.items():
+            if hasattr(val, 'meta_info') and val.meta_info is not None:
+                val.meta_info["global_megatron_dp_ranks"] = dp_rank_mapping
+    
     # perform dispatch
     dp_size = max(dp_rank_mapping) + 1
     return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
