@@ -21,7 +21,7 @@ import multiprocessing as mp
 import os
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Optional, List, Dict
 from uuid import uuid4
 
 import numpy as np
@@ -61,6 +61,7 @@ from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import is_ipv6
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.utils.partial_rollout_buffer import PartialRolloutBuffer
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.schemas import (
@@ -288,6 +289,33 @@ class SGLangRollout(BaseRollout):
         self._init_inference_engine(trust_remote_code, actor_module, port)
 
         self._init_sampling_params(**kwargs)
+
+        # Initialize partial rollout buffer if enabled
+        self.partial_rollout_buffer = None
+        if self.config.get("enable_partial_rollout", False):
+            # Get core parameters
+            self.over_sampling_batch_size = getattr(self.config, 'over_sampling_batch_size', None)
+            self.partial_buffer_max_size = getattr(self.config, 'partial_buffer_max_size', 1000)
+            self.partial_step_window = getattr(self.config, 'partial_step_window', 3)
+
+            # Initialize buffer
+            self.partial_rollout_buffer = PartialRolloutBuffer(
+                max_size=self.partial_buffer_max_size,
+                max_steps=self.partial_step_window
+            )
+
+            # Statistics tracking
+            self._session_stats = {
+                'total_requests': 0,
+                'completed_requests': 0,
+                'interrupted_requests': 0,
+                'continued_requests': 0,
+                'partial_samples_collected': 0
+            }
+
+            logger.info(f"Partial rollout enabled: buffer_max_size={self.partial_buffer_max_size}, "
+                       f"step_window={self.partial_step_window}, "
+                       f"over_sampling_batch_size={'auto' if self.over_sampling_batch_size is None else self.over_sampling_batch_size}")
 
         self.processing_class = processing_class
         try:
@@ -627,6 +655,10 @@ class SGLangRollout(BaseRollout):
         Note that in GRPO, if the prompts are validated, we repeat the prompts for rollout.n times in ray_trainer.
         Thus we do not need to repeat the prompts here and set the sampling parameter n to 1.
         """
+        if self.config.get("enable_partial_rollout", False):
+            return self._batch_level_generate_sequences_with_partial_rollout(prompts, **kwargs)
+
+        # Original implementation for non-partial rollout
         # input ids: (bs, prompt_length), left-padded
         idx = prompts.batch["input_ids"]
         # attention_mask: (bs, seq_length), left-padded
@@ -791,6 +823,618 @@ class SGLangRollout(BaseRollout):
         if self._engine is not None and self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    @GPUMemoryLogger(role="sglang rollout", logger=logger)
+    @torch.no_grad()
+    def _batch_level_generate_sequences_with_partial_rollout(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate sequences with partial rollout support and oversampling optimization.
+
+        Implements intelligent batch processing with continuation requests from buffer,
+        oversampling with dynamic abort, and partial result collection for improved
+        training efficiency.
+
+        Args:
+            prompts: DataProto containing input prompts batch
+            **kwargs: Additional sampling parameters
+
+        Returns:
+            DataProto: Generated sequences with partial rollout optimization
+        """
+        # Extract gen batch size
+        batch_size = prompts.batch["input_ids"].size(0)
+
+        # Calculate effective over sample size first
+        if self.over_sampling_batch_size is not None:
+            if self.over_sampling_batch_size <= batch_size:
+                logger.warning(f"Configured over_sampling_batch_size ({self.over_sampling_batch_size}) <= "
+                             f"gen_batch_size ({batch_size}). For partial rollout to be effective, "
+                             f"automatically setting to 2 * gen_batch_size = {batch_size * 2}")
+                effective_over_sample_size = batch_size * 2
+            else:
+                effective_over_sample_size = self.over_sampling_batch_size
+        else:
+            effective_over_sample_size = batch_size * 2
+
+        logger.info(f"Effective oversampling size: {effective_over_sample_size} "
+                   f"(gen_batch_size: {batch_size})")
+
+        # Update buffer step counter for eviction policy
+        if self.partial_rollout_buffer:
+            self.partial_rollout_buffer.increment_step()
+
+        # Get continuation requests from buffer (up to effective_over_sample_size)
+        continuation_requests = []
+        if self.partial_rollout_buffer and not self.partial_rollout_buffer.is_empty():
+            continuation_requests = self.partial_rollout_buffer.get_continuation_requests(effective_over_sample_size)
+
+        # Prepare individual requests (continuations + new) to reach effective_over_sample_size
+        individual_requests = self._prepare_individual_requests_for_partial_rollout(
+            prompts, continuation_requests, effective_over_sample_size
+        )
+
+        # For partial rollout, always use oversampling mode with abort mechanism
+        # This ensures partial results are collected for continuation
+        target_completion = batch_size
+        requests_to_send = individual_requests  # already at effective_over_sample_size
+
+        logger.info(f"Partial rollout mode: sending {len(requests_to_send)} requests, "
+                   f"target completion: {target_completion}")
+
+        completed_results = self._execute_oversampled_requests_with_abort(
+            requests_to_send, target_completion, prompts, **kwargs
+        )
+
+        # Convert results to DataProto format and return
+        result = self._convert_results_to_dataproto(completed_results, prompts)
+
+        # free cache engine to release memory resources
+        if self._engine is not None and self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self._engine.flush_cache())
+
+        return result
+
+    def _prepare_individual_requests_for_partial_rollout(self, prompts: DataProto, continuation_requests: List[Dict], target_count: int) -> List[Dict]:
+        """Prepare individual requests for partial rollout processing.
+
+        Handles both continuation requests from buffer and new requests from prompts.
+        Uses token ID-based concatenation for continuation to avoid tokenization issues.
+
+        Args:
+            prompts: DataProto containing new prompts
+            continuation_requests: List of continuation requests from buffer
+            target_count: Target total number of requests to prepare
+
+        Returns:
+            List[Dict]: Combined list of continuation and new requests
+        """
+        import time
+
+        individual_requests = []
+        batch_size = prompts.batch["input_ids"].size(0)
+
+        # Process continuation requests first
+        for cont_req in continuation_requests:
+            # Direct token ID concatenation for continuation
+            original_input_ids = cont_req['original_input_ids']
+            partial_response_token_ids = torch.tensor(cont_req['partial_response_token_ids'])
+            continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
+
+            # Create sampling params with proper max_new_tokens for continuation
+            continuation_sampling_params = cont_req['sampling_params'].copy()
+            # Consider model length limit for continuation requests
+            input_length = len(continued_input_ids)
+            model_limited_max_tokens = self.config.max_model_len - input_length - 1
+            continuation_sampling_params["max_new_tokens"] = min(cont_req['remaining_max_tokens'], model_limited_max_tokens)
+
+            # Create continuation request with tracking info
+            request = {
+                'request_id': f"cont_{cont_req['request_id']}_{int(time.time() * 1000) % 10000}",
+                'input_ids': continued_input_ids,
+                'sampling_params': continuation_sampling_params,
+                'is_continuation': True,
+                'original_request_id': cont_req['request_id'],
+                'original_input_ids': original_input_ids,
+                'partial_response_token_ids': partial_response_token_ids,
+                'completion_tokens_so_far': cont_req.get('completion_tokens_so_far', partial_response_token_ids.shape[0]),
+                'remaining_max_tokens': cont_req['remaining_max_tokens'],
+                'batch_index': cont_req.get('batch_index', -1),
+                # Preserve multi-modal data from original request
+                'image_data': cont_req.get('image_data'),
+                'multi_modal_data': cont_req.get('multi_modal_data')
+            }
+            individual_requests.append(request)
+
+        # Process new requests to fill remaining slots to reach target_count
+        needed_new_requests = max(0, target_count - len(continuation_requests))
+        if needed_new_requests > 0:
+            # Prepare raw prompt IDs and multi-modal data for new requests
+            non_tensor_batch = prompts.non_tensor_batch.copy()
+
+            # Prepare raw_prompt_ids if not present
+            if "raw_prompt_ids" not in non_tensor_batch:
+                non_tensor_batch["raw_prompt_ids"] = np.array(
+                    [_pre_process_inputs(self.pad_token_id, prompts.batch["input_ids"][i]).tolist()
+                     for i in range(batch_size)],
+                    dtype=object,
+                )
+
+            # Extract multi-modal data if present
+            multi_modal_data_list = None
+            image_data_list = None
+            if "multi_modal_data" in non_tensor_batch:
+                multi_modal_data_list = non_tensor_batch.pop("multi_modal_data")
+                image_data_list = [
+                    data.get("image", None) if isinstance(data, dict) else None
+                    for data in multi_modal_data_list
+                ]
+
+            # Create new requests (cycle through prompts if needed)
+            for i in range(needed_new_requests):
+                # Cycle through prompts if we need more than available
+                prompt_index = i % batch_size
+                raw_prompt_ids = non_tensor_batch["raw_prompt_ids"][prompt_index]
+                if not isinstance(raw_prompt_ids, list | np.ndarray):
+                    raise TypeError(f"raw_prompt_ids must be a list or numpy array, got {type(raw_prompt_ids)}")
+
+                # Create sampling params with proper do_sample/is_validate logic
+                request_sampling_params = self.sampling_params.copy()
+                do_sample = prompts.meta_info.get("do_sample", True)
+                is_validate = prompts.meta_info.get("validate", False)
+
+                if not do_sample:
+                    request_sampling_params.update(
+                        {
+                            "n": 1,
+                            "presence_penalty": 0.0,
+                            "frequency_penalty": 0.0,
+                            "repetition_penalty": 1.0,
+                            "temperature": 0,
+                            "top_p": 1,
+                            "top_k": -1,
+                            "ignore_eos": False,
+                            "min_new_tokens": 0,
+                            "max_new_tokens": self.config.response_length,
+                            "skip_special_tokens": True,
+                            "spaces_between_special_tokens": True,
+                        }
+                    )
+                elif is_validate:
+                    # For validation mode, use val_kwargs without max_new_tokens constraint
+                    request_sampling_params.update(
+                        {
+                            "top_k": self.config.val_kwargs.top_k,
+                            "top_p": self.config.val_kwargs.top_p,
+                            "temperature": self.config.val_kwargs.temperature,
+                            "n": 1,  # if validate, already repeat in ray_trainer
+                        }
+                    )
+                else:
+                    # Consider model length limit for new requests
+                    input_length = len(raw_prompt_ids)
+                    model_limited_max_tokens = self.config.max_model_len - input_length - 1
+                    request_sampling_params["max_new_tokens"] = min(self.config.response_length, model_limited_max_tokens)
+
+                request = {
+                    'request_id': f"new_{i}_{uuid4()}",
+                    'input_ids': torch.tensor(raw_prompt_ids),
+                    'sampling_params': request_sampling_params,
+                    'is_continuation': False,
+                    'batch_index': prompt_index,
+                    'original_input_ids': torch.tensor(raw_prompt_ids),
+                    'remaining_max_tokens': self.config.response_length,
+                    'completion_tokens_so_far': 0,
+                    # Add multi-modal data support
+                    'image_data': image_data_list[prompt_index] if image_data_list else None,
+                    'multi_modal_data': multi_modal_data_list[prompt_index] if multi_modal_data_list else None
+                }
+                individual_requests.append(request)
+
+        logger.info(f"Prepared {len(individual_requests)} requests: {len(continuation_requests)} continuations, "
+                   f"{len(individual_requests) - len(continuation_requests)} new")
+
+        return individual_requests
+
+    def _execute_oversampled_requests_with_abort(self, requests: List[Dict], target_completion: int, prompts: DataProto, **kwargs) -> List[Dict]:
+        """Execute oversampled requests with intelligent abort strategy.
+
+        Sends more requests than needed and aborts remaining when target completion is reached.
+        Collects valuable partial results from aborted requests.
+
+        Args:
+            requests: List of requests to execute
+            target_completion: Target number of complete results needed
+            prompts: Original DataProto containing meta-info for sampling parameters
+            **kwargs: Additional sampling parameters
+
+        Returns:
+            List[Dict]: Completed results
+        """
+        if self._tp_rank != 0:
+            return []
+
+        async def _execute_async():
+            """Async inner function to handle oversampled execution."""
+            # Create async tasks for all requests
+            tasks = []
+            task_to_request = {}
+
+            for request in requests:
+                task = asyncio.create_task(self._send_individual_sglang_request(request, prompts, **kwargs))
+                tasks.append(task)
+                task_to_request[task] = request
+
+            completed_results = []
+            completed_count = 0
+            valuable_partials = []
+
+            try:
+                # Process completed requests until target is reached
+                for completed_task in asyncio.as_completed(tasks):
+                    result = await completed_task
+
+                    if result.get('is_complete', False):
+                        completed_results.append(result)
+                        completed_count += 1
+
+                        # Check if target completion is reached
+                        if completed_count >= target_completion:
+                            logger.info(f"Target completion {target_completion} reached, aborting remaining requests")
+
+                            # Abort remaining requests
+                            await self._engine.abort_request(abort_all=True)
+                            break
+
+                    elif result.get('is_valuable_partial', False):
+                        valuable_partials.append(result)
+
+                # Collect final results from all tasks
+                final_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process remaining results
+                for i, result in enumerate(final_results):
+                    if isinstance(result, Exception):
+                        logger.warning(f"Request {i} failed: {result}")
+                        continue
+
+                    if not result.get('is_complete', False) and result.get('is_valuable_partial', False):
+                        if result not in valuable_partials:
+                            valuable_partials.append(result)
+
+            except Exception as e:
+                logger.error(f"Error in oversampled execution: {e}")
+                # Try to collect any available results
+                final_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Store valuable partial results
+            if valuable_partials and self.partial_rollout_buffer:
+                self._store_valuable_partial_results(valuable_partials, task_to_request)
+                logger.info(f"Stored {len(valuable_partials)} valuable partial results")
+
+            logger.info(f"Oversampled execution completed: {len(completed_results)} complete, "
+                       f"{len(valuable_partials)} partial stored")
+
+            return completed_results
+
+        # Run async function with event loop
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(_execute_async())
+
+    async def _send_individual_sglang_request(self, request: Dict, prompts: DataProto, **kwargs) -> Dict:
+        """Send individual request to SGLang engine.
+
+        Args:
+            request: Individual request dictionary
+            prompts: Original DataProto containing meta-info for sampling parameters
+            **kwargs: Additional sampling parameters
+
+        Returns:
+            Dict: Response with completion status
+        """
+        try:
+            # Validate input data
+            self._validate_request_input(request)
+
+            # Prepare sampling parameters with proper do_sample/is_validate logic
+            sampling_params = request['sampling_params'].copy()
+
+            # Extract do_sample and validate status from original prompts meta info
+            do_sample = prompts.meta_info.get("do_sample", True)
+            is_validate = prompts.meta_info.get("validate", False)
+
+            # Apply the same logic as original SGLang rollout
+            if not do_sample:
+                # For greedy decoding, use response_length as the generation limit
+                sampling_params.update(
+                    {
+                        "n": 1,
+                        "presence_penalty": 0.0,
+                        "frequency_penalty": 0.0,
+                        "repetition_penalty": 1.0,
+                        "temperature": 0,
+                        "top_p": 1,
+                        "top_k": -1,
+                        "ignore_eos": False,
+                        "min_new_tokens": 0,
+                        "max_new_tokens": self.config.response_length,
+                        "skip_special_tokens": True,
+                        "spaces_between_special_tokens": True,
+                    }
+                )
+            elif is_validate:
+                # For validation mode, use val_kwargs without max_new_tokens constraint
+                sampling_params.update(
+                    {
+                        "top_k": self.config.val_kwargs.top_k,
+                        "top_p": self.config.val_kwargs.top_p,
+                        "temperature": self.config.val_kwargs.temperature,
+                        "n": 1,  # if validate, already repeat in ray_trainer
+                    }
+                )
+            else:
+                # For normal sampling, set max_new_tokens based on remaining tokens and model limit
+                input_length = len(request['input_ids'])
+                model_limited_max_tokens = self.config.max_model_len - input_length - 1
+                requested_max_tokens = request.get('remaining_max_tokens', self.config.response_length)
+                sampling_params["max_new_tokens"] = min(requested_max_tokens, model_limited_max_tokens)
+
+            # Update with any additional kwargs
+            sampling_params.update(kwargs)
+
+            # Send request to SGLang engine
+            output = await self._engine.async_generate(
+                prompt=None,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                input_ids=request['input_ids'].tolist(),
+                image_data=request.get('image_data'),
+            )
+
+            # Process response with enhanced log probability handling
+            results = _post_process_outputs(self.processing_class, [output])
+            response = results[0][0]
+            # Extract log probabilities for training consistency
+            if len(results[0]) > 1 and results[0][1] is not None:
+                log_probs = results[0][1]
+            else:
+                log_probs = None
+
+            # Check SGLang server's finish reason to determine completion status
+            finish_reason = output.get("meta_info", {}).get("finish_reason", {}).get("type", "")
+
+            if finish_reason in ["length", "stop"]:
+                # SGLang server completed normally (either max length or EOS)
+                is_complete = True
+                is_valuable_partial = False
+            else:
+                # Request was aborted or had other status - treat as valuable partial result
+                is_complete = False
+                is_valuable_partial = True
+
+            return {
+                'request_id': request['request_id'],
+                'response': response,
+                'log_probs': log_probs,  # Add log_probs for consistency with batch level
+                'batch_index': request.get('batch_index', -1),
+                'is_complete': is_complete,
+                'is_valuable_partial': is_valuable_partial,
+                'original_request': request
+            }
+
+        except Exception as e:
+            # Enhanced error handling with more context
+            error_context = {
+                'request_id': request['request_id'],
+                'input_length': len(request.get('input_ids', [])),
+                'sampling_params': request.get('sampling_params', {}),
+                'is_continuation': request.get('is_continuation', False),
+                'error_type': type(e).__name__
+            }
+            logger.error(f"Request {request['request_id']} failed: {e}. Context: {error_context}")
+            return {
+                'request_id': request['request_id'],
+                'error': str(e),
+                'batch_index': request.get('batch_index', -1),
+                'is_complete': False,
+                'is_valuable_partial': False,
+                'error_context': error_context
+            }
+
+    def _validate_request_input(self, request: Dict) -> None:
+        """Validation of critical request fields.
+
+        Args:
+            request: Request dictionary to validate
+
+        Raises:
+            ValueError: If critical request data is invalid
+        """
+        # Only validate most critical fields to avoid SGLang engine errors
+        if 'input_ids' not in request:
+            raise ValueError("Missing required field 'input_ids' in request")
+
+        input_ids = request['input_ids']
+        if isinstance(input_ids, torch.Tensor) and input_ids.dim() != 1:
+            raise ValueError(f"input_ids must be 1-dimensional tensor, got {input_ids.dim()} dimensions")
+
+    def _store_valuable_partial_results(self, partial_results: List[Dict], task_to_request: Dict):
+        """Store valuable partial results in buffer.
+
+        Args:
+            partial_results: List of valuable partial results
+            task_to_request: Mapping from tasks to original requests
+        """
+        buffer_entries = []
+
+        for result in partial_results:
+            original_request = result.get('original_request', {})
+            request_id = result['request_id']
+
+            # For partial results, we need to extract non-padding tokens
+            response_tensor = result['response']
+
+            # Find actual content by removing padding tokens
+            if hasattr(response_tensor, 'tolist'):
+                response_list = response_tensor.tolist()
+            else:
+                response_list = list(response_tensor)
+
+            # Remove trailing padding tokens
+            actual_response_tokens = []
+            for token in response_list:
+                if token != self.pad_token_id:
+                    actual_response_tokens.append(token)
+                else:
+                    # Stop at first pad token (assuming right padding)
+                    break
+
+            completion_tokens = len(actual_response_tokens)
+            remaining_max_tokens = original_request.get('remaining_max_tokens', self.config.response_length) - completion_tokens
+
+            # Create buffer entry with proper tensor format consistency
+            buffer_entry = {
+                'request_id': request_id,
+                'original_input_ids': original_request.get('original_input_ids').clone().detach() if original_request.get('original_input_ids') is not None else None,
+                'partial_response_token_ids': torch.tensor(actual_response_tokens, dtype=torch.long),
+                'completion_tokens': completion_tokens,
+                'remaining_max_tokens': remaining_max_tokens,
+                'sampling_params': original_request.get('sampling_params', {}),
+                'created_step': self.partial_rollout_buffer.current_step if self.partial_rollout_buffer else 0,
+                'is_continuation': True,
+                # Preserve multi-modal data for future continuation
+                'image_data': original_request.get('image_data'),
+                'multi_modal_data': original_request.get('multi_modal_data'),
+                'batch_index': original_request.get('batch_index', -1)
+            }
+
+            buffer_entries.append(buffer_entry)
+
+        # Store in buffer
+        if buffer_entries and self.partial_rollout_buffer:
+            self.partial_rollout_buffer.store_partial_requests(buffer_entries)
+
+    def _convert_results_to_dataproto(self, results: List[Dict], original_prompts: DataProto) -> DataProto:
+        """Convert completed results to DataProto format.
+
+        Args:
+            results: List of completed results
+            original_prompts: Original prompts DataProto for reference
+
+        Returns:
+            DataProto: Formatted results in DataProto structure
+        """
+        if not results:
+            # Return empty DataProto if no results
+            return DataProto(batch=TensorDict({}), non_tensor_batch={})
+
+        # Extract original information
+        original_idx = original_prompts.batch["input_ids"]
+        original_attention_mask = original_prompts.batch["attention_mask"]
+        original_position_ids = original_prompts.batch["position_ids"]
+        batch_size = len(results)
+        device = original_idx.device
+
+        # Prepare responses
+        responses = []
+        for result in results:
+            response = result.get('response', torch.zeros(self.config.response_length, dtype=torch.long))
+            # Pad to expected length if needed
+            if len(response) < self.config.response_length:
+                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+            responses.append(response)
+
+        # Stack responses
+        if responses:
+            responses_tensor = torch.stack(responses).to(device)
+        else:
+            responses_tensor = torch.zeros(batch_size, self.config.response_length, dtype=torch.long, device=device)
+
+        # Create full sequences
+        seq = torch.cat([original_idx, responses_tensor], dim=-1)
+
+        # Update position_ids and attention_mask
+        response_length = responses_tensor.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+
+        if original_position_ids.dim() == 3:
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, original_position_ids.size(1), -1)
+
+        response_position_ids = original_position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([original_position_ids, response_position_ids], dim=-1)
+
+        # Create attention mask for responses
+        eos_token_id = original_prompts.meta_info.get("eos_token_id", 2)
+        response_attention_mask = get_response_mask(
+            response_id=responses_tensor, eos_token=eos_token_id, dtype=original_attention_mask.dtype
+        )
+        attention_mask = torch.cat((original_attention_mask, response_attention_mask), dim=-1)
+
+        # Create batch tensor
+        batch = TensorDict(
+            {
+                "prompts": original_idx,
+                "responses": responses_tensor,
+                "input_ids": seq,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+
+        # Add rollout_log_probs for downstream model training
+        if self.config.calculate_log_probs:
+            # Extract log_probs from individual request results
+            rollout_log_probs = []
+            for result in results:
+                if 'log_probs' in result and result['log_probs'] is not None:
+                    log_probs = result['log_probs'].to(responses_tensor.device)
+                    # Pad to expected length if needed
+                    if len(log_probs) < self.config.response_length:
+                        log_probs = pad_sequence_to_length(
+                            log_probs, self.config.response_length, self.pad_token_id
+                        )
+                    rollout_log_probs.append(log_probs)
+                else:
+                    # Fallback for cases without log_probs
+                    rollout_log_probs.append(torch.zeros(self.config.response_length, dtype=torch.float, device=responses_tensor.device))
+
+            if rollout_log_probs:
+                rollout_log_probs_tensor = torch.stack(rollout_log_probs)
+                batch["rollout_log_probs"] = rollout_log_probs_tensor
+
+        # Process non_tensor_batch to match original flow
+        non_tensor_batch = original_prompts.non_tensor_batch.copy()
+        if "raw_prompt_ids" not in non_tensor_batch:
+            batch_size = original_idx.size(0)
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, original_idx[i]).tolist() for i in range(batch_size)],
+                dtype=object,
+            )
+
+        # Preserve multi-modal data in output with strict processing for consistency with original flow
+        multi_modal_data_list = []
+        for i, result in enumerate(results):
+            # Priority 1: Use multi-modal data from result (passed through buffer)
+            if 'multi_modal_data' in result and result['multi_modal_data'] is not None:
+                multi_modal_data_list.append(result['multi_modal_data'])
+            else:
+                # Priority 2: Get from original prompts with strict boundary checking
+                original_batch_index = result.get('batch_index', i)
+                if (original_batch_index >= 0 and
+                    'multi_modal_data' in original_prompts.non_tensor_batch and
+                    original_batch_index < len(original_prompts.non_tensor_batch['multi_modal_data'])):
+                    original_multi_modal_data = original_prompts.non_tensor_batch['multi_modal_data'][original_batch_index]
+                    multi_modal_data_list.append(original_multi_modal_data)
+                else:
+                    # Fallback: None for missing data
+                    multi_modal_data_list.append(None)
+
+        # Add multi-modal data to non_tensor_batch if present
+        if any(data is not None for data in multi_modal_data_list):
+            non_tensor_batch['multi_modal_data'] = np.array(multi_modal_data_list, dtype=object)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

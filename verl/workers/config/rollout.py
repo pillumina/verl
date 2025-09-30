@@ -176,9 +176,18 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    # Partial rollout configuration
+    enable_partial_rollout: bool = False
+    # Optional: if None, auto-compute as 2x input batch size
+    over_sampling_batch_size: Optional[int] = None  
+    partial_buffer_max_size: int = 1000
+    partial_step_window: int = 3
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:
             assert self.expert_parallel_size == (self.tensor_model_parallel_size * self.data_parallel_size), (
                 "expert_parallel_size must be equal to tensor_model_parallel_size * data_parallel_size"
             )
+
+
