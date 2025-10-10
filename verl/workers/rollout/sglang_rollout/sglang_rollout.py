@@ -1052,6 +1052,10 @@ class SGLangRollout(BaseRollout):
         Returns:
             List[Dict]: Completed results
         """
+        print(f"=== DEBUG: Execute Oversampled Requests ===")
+        print(f"Total requests sent: {len(requests)}")
+        print(f"Target completion: {target_completion}")
+
         if self._tp_rank != 0:
             return []
 
@@ -1133,6 +1137,7 @@ class SGLangRollout(BaseRollout):
         Returns:
             Dict: Response with completion status
         """
+        print(f"DEBUG: Sending request {request['request_id']}")
         try:
             # Validate input data
             self._validate_request_input(request)
@@ -1204,6 +1209,10 @@ class SGLangRollout(BaseRollout):
             # Check SGLang server's finish reason to determine completion status
             finish_reason = output.get("meta_info", {}).get("finish_reason", {}).get("type", "")
 
+            print(f"DEBUG: Request {request['request_id']} completed")
+            print(f"  finish_reason: {finish_reason}")
+            print(f"  is_complete: {finish_reason in ['length', 'stop']}")
+
             if finish_reason in ["length", "stop"]:
                 # SGLang server completed normally (either max length or EOS)
                 is_complete = True
@@ -1224,6 +1233,7 @@ class SGLangRollout(BaseRollout):
             }
 
         except Exception as e:
+            print(f"ERROR: Request {request['request_id']} failed: {e}")
             # Enhanced error handling with more context
             error_context = {
                 'request_id': request['request_id'],
@@ -1325,10 +1335,16 @@ class SGLangRollout(BaseRollout):
         Returns:
             DataProto: Formatted results in DataProto structure
         """
+        print(f"=== DEBUG: _convert_results_to_dataproto ===")
+        
         if not results:
             # Return empty DataProto if no results
             return DataProto(batch=TensorDict({}), non_tensor_batch={})
 
+        print(f"DEBUG: results type: {type(results)}")
+        print(f"DEBUG: results length: {len(results)}")
+        print(f"DEBUG: results[0] type: {type(results[0]) if results else 'N/A'}")
+        
         # Extract original information
         original_idx = original_prompts.batch["input_ids"]
         original_attention_mask = original_prompts.batch["attention_mask"]
@@ -1804,6 +1820,7 @@ class SGLangRollout(BaseRollout):
                         final_results = await asyncio.gather(*all_tasks, return_exceptions=True)
                         # Abort all requests in SGLang engine
                         await self._engine.abort_request(abort_all=True)
+                        print(f"DEBUG: Abort command sent")
                     return final_results
 
                 loop = asyncio.get_event_loop()
