@@ -926,7 +926,7 @@ class SGLangRollout(BaseRollout):
         for cont_req in continuation_requests:
             # Direct token ID concatenation for continuation
             original_input_ids = cont_req['original_input_ids']
-            partial_response_token_ids = torch.tensor(cont_req['partial_response_token_ids'])
+            partial_response_token_ids = cont_req['partial_response_token_ids'].detach().clone()
 
             # original_input_ids should already have padding removed during buffer storage
             continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
@@ -1257,19 +1257,14 @@ class SGLangRollout(BaseRollout):
             output = await self._engine.async_generate(
                 prompt=None,
                 sampling_params=sampling_params,
-                return_logprob=True,
+                return_logprob=False,  # Partial rollout does not need log_probs for now
                 input_ids=request['input_ids'].tolist(),
                 image_data=request.get('image_data'),
             )
 
-            # Process response with enhanced log probability handling
-            results = _post_process_outputs(self.processing_class, [output])
-            response = results[0][0]
-            # Extract log probabilities for training consistency
-            if len(results[0]) > 1 and results[0][1] is not None:
-                log_probs = results[0][1]
-            else:
-                log_probs = None
+            # Process response directly (without log_probs for partial rollout)
+            response = torch.tensor(output["output_ids"], dtype=torch.long)
+            log_probs = None  # Partial rollout does not use SGLang log_probs for now
 
             # Check SGLang server's finish reason to determine completion status
             finish_reason = output.get("meta_info", {}).get("finish_reason", {}).get("type", "")
