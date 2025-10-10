@@ -928,13 +928,24 @@ class SGLangRollout(BaseRollout):
             original_input_ids = cont_req['original_input_ids']
             partial_response_token_ids = cont_req['partial_response_token_ids'].detach().clone()
 
-            # original_input_ids should already have padding removed during buffer storage
-            continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
+            # Handle continuation with text concatenation for position encoding consistency
+            if cont_req.get('image_data') or cont_req.get('multi_modal_data'):
+                # Use original token_ids concatenation for multi-modal data
+                continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
+                logger.debug(f"Using token_ids concatenation for multi-modal continuation {cont_req['request_id']}")
+            else:
+                # Use text concatenation for text-only data
+                try:
+                    original_text = self.processing_class.decode(original_input_ids)
+                    partial_response_text = self.processing_class.decode(partial_response_token_ids)
+                    full_text = original_text + partial_response_text
+                    continued_input_ids = self.processing_class.encode(full_text)
 
-            # Debug: Log padding verification for first continuation request
-            if cont_req == continuation_requests[0]:
-                pad_count = (original_input_ids == self.pad_token_id).sum().item()
-                logger.info(f"Continuation request - Pad count (should be 0): {pad_count}")
+                    logger.debug(f"Text concatenation: '{original_text}' + '{partial_response_text}'")
+                except Exception as e:
+                    # Fallback to token_ids concatenation if text processing fails
+                    logger.warning(f"Text concatenation failed for continuation {cont_req['request_id']}, falling back to token_ids: {e}")
+                    continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
 
             # Create sampling params with proper max_new_tokens for continuation
             continuation_sampling_params = cont_req['sampling_params'].copy()
@@ -1254,13 +1265,25 @@ class SGLangRollout(BaseRollout):
             sampling_params.update(kwargs)
 
             # Send request to SGLang engine
-            output = await self._engine.async_generate(
-                prompt=None,
-                sampling_params=sampling_params,
-                return_logprob=False,  # Partial rollout does not need log_probs for now
-                input_ids=request['input_ids'].tolist(),
-                image_data=request.get('image_data'),
-            )
+            try:
+                # Use text mode to ensure correct position encoding
+                text = self.processing_class.decode(request['input_ids'])
+                output = await self._engine.async_generate(
+                    prompt=text,
+                    sampling_params=sampling_params,
+                    return_logprob=False,  # Partial rollout does not need log_probs for now
+                    image_data=request.get('image_data'),
+                )
+            except Exception as e:
+                # Fallback to input_ids mode if text mode fails
+                logger.warning(f"Text mode failed for request {request.get('request_id', 'unknown')}, falling back to input_ids: {e}")
+                output = await self._engine.async_generate(
+                    prompt=None,
+                    sampling_params=sampling_params,
+                    return_logprob=False,
+                    input_ids=request['input_ids'].tolist(),
+                    image_data=request.get('image_data'),
+                )
 
             # Process response directly (without log_probs for partial rollout)
             response = torch.tensor(output["output_ids"], dtype=torch.long)
