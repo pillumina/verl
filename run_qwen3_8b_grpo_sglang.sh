@@ -1,5 +1,8 @@
 set -x
 
+export HYDRA_FULL_ERROR=1
+export CUDA_VISIBLE_DEVICES=2,3,4,5
+
 # WORKSPACE_HOME and DATA_HOME support custom path configuration.
 WORKSPACE_HOME=/data/h00513115
 DATA_HOME=/data/h00513115
@@ -8,7 +11,7 @@ pr_enable=False
 over_sampling_batch_size=64
 
 sp_size=4
-num_gpu=8
+num_gpu=4
 tp_size=2
 train_prompt_bsz=32
 train_prompt_mini_bsz=8
