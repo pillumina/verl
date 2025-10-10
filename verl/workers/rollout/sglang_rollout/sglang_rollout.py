@@ -845,6 +845,13 @@ class SGLangRollout(BaseRollout):
         # Extract gen batch size
         batch_size = prompts.batch["input_ids"].size(0)
 
+        # Debug: Log first example to verify padding removal
+        if batch_size > 0:
+            example_input_ids = prompts.batch["input_ids"][0]
+            logger.info(f"First input_ids (first 10 tokens): {example_input_ids[:10].tolist()}")
+            pad_count = (example_input_ids == self.pad_token_id).sum().item()
+            logger.info(f"Pad tokens in first example: {pad_count}")
+
         # Calculate effective over sample size first
         if self.over_sampling_batch_size is not None:
             if self.over_sampling_batch_size <= batch_size:
@@ -920,7 +927,14 @@ class SGLangRollout(BaseRollout):
             # Direct token ID concatenation for continuation
             original_input_ids = cont_req['original_input_ids']
             partial_response_token_ids = torch.tensor(cont_req['partial_response_token_ids'])
+
+            # original_input_ids should already have padding removed during buffer storage
             continued_input_ids = torch.cat([original_input_ids, partial_response_token_ids], dim=-1)
+
+            # Debug: Log padding verification for first continuation request
+            if cont_req == continuation_requests[0]:
+                pad_count = (original_input_ids == self.pad_token_id).sum().item()
+                logger.info(f"Continuation request - Pad count (should be 0): {pad_count}")
 
             # Create sampling params with proper max_new_tokens for continuation
             continuation_sampling_params = cont_req['sampling_params'].copy()
@@ -976,6 +990,28 @@ class SGLangRollout(BaseRollout):
                 # Cycle through prompts if we need more than available
                 prompt_index = i % batch_size
                 raw_prompt_ids = non_tensor_batch["raw_prompt_ids"][prompt_index]
+
+                # Debug: Log first new request padding removal
+                if i == 0:
+                    if isinstance(raw_prompt_ids, torch.Tensor):
+                        original_pad_count = (raw_prompt_ids == self.pad_token_id).sum().item()
+                    elif isinstance(raw_prompt_ids, np.ndarray):
+                        original_pad_count = (raw_prompt_ids == self.pad_token_id).sum()
+                    else:
+                        original_pad_count = 0
+
+                # Remove left padding from token IDs
+                if isinstance(raw_prompt_ids, torch.Tensor):
+                    raw_prompt_ids = _pre_process_inputs(self.pad_token_id, raw_prompt_ids).tolist()
+                elif isinstance(raw_prompt_ids, np.ndarray):
+                    raw_prompt_ids_tensor = torch.tensor(raw_prompt_ids)
+                    raw_prompt_ids = _pre_process_inputs(self.pad_token_id, raw_prompt_ids_tensor).tolist()
+
+                # Debug: Log padding removal for first new request
+                if i == 0:
+                    processed_pad_count = (torch.tensor(raw_prompt_ids) == self.pad_token_id).sum().item()
+                    logger.info(f"New request - Original pad count: {original_pad_count}, Processed pad count: {processed_pad_count}")
+
                 if not isinstance(raw_prompt_ids, list | np.ndarray):
                     raise TypeError(f"raw_prompt_ids must be a list or numpy array, got {type(raw_prompt_ids)}")
 
@@ -1333,9 +1369,14 @@ class SGLangRollout(BaseRollout):
             remaining_max_tokens = original_request.get('remaining_max_tokens', self.config.response_length) - completion_tokens
 
             # Create buffer entry with proper tensor format consistency
+            original_input_ids = original_request.get('original_input_ids')
+            # Remove left padding before storing in buffer
+            if original_input_ids is not None:
+                original_input_ids = _pre_process_inputs(self.pad_token_id, original_input_ids).clone().detach()
+
             buffer_entry = {
                 'request_id': request_id,
-                'original_input_ids': original_request.get('original_input_ids').clone().detach() if original_request.get('original_input_ids') is not None else None,
+                'original_input_ids': original_input_ids,
                 'partial_response_token_ids': torch.tensor(actual_response_tokens, dtype=torch.long),
                 'completion_tokens': completion_tokens,
                 'remaining_max_tokens': remaining_max_tokens,
