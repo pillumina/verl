@@ -1055,12 +1055,41 @@ class SGLangRollout(BaseRollout):
         print(f"=== DEBUG: Execute Oversampled Requests ===")
         print(f"Total requests sent: {len(requests)}")
         print(f"Target completion: {target_completion}")
+        print(f"TP rank: {self._tp_rank}")
 
-        if self._tp_rank != 0:
-            return []
+        # Execute only on tp_rank=0, then broadcast to all ranks
+        completed_results = None
+
+        if self._tp_rank == 0:
+            print("DEBUG: TP rank 0 executing async requests")
+            completed_results = self._execute_async_requests(requests, target_completion, prompts, **kwargs)
+        else:
+            print(f"DEBUG: TP rank {self._tp_rank} waiting for broadcast")
+
+        # Synchronize results across all TP ranks
+        print("DEBUG: Synchronizing results across TP ranks")
+        dist.barrier()
+        [completed_results] = broadcast_pyobj(
+            data=[completed_results],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),  # tp_rank=0
+            force_cpu_device=False,
+        )
+
+        # Ensure we return a list even if None was received
+        if completed_results is None:
+            completed_results = []
+            print("DEBUG: Received None, returning empty list")
+        else:
+            print(f"DEBUG: Received {len(completed_results)} results from broadcast")
+
+        return completed_results
+
+    def _execute_async_requests(self, requests: List[Dict], target_completion: int, prompts: DataProto, **kwargs) -> List[Dict]:
+        """Execute async requests with abort strategy (tp_rank=0 only)."""
 
         async def _execute_async():
-            """Async inner function to handle oversampled execution."""
             # Create async tasks for all requests
             tasks = []
             task_to_request = {}
