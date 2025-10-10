@@ -22,6 +22,9 @@ n_samples_per_prompt=8
 max_prompt_length=1024
 max_response_length=16384
 
+
+rollout_max_response_length=16384
+
 CKPTS_DIR=$WORKSPACE_HOME/logs/ckpt/qwen3_8b
 model_path=$DATA_HOME/models/qwen3-8b
 train_data=$DATA_HOME/datasets/dapo-math-17k/data/dapo-math-17k.parquet
@@ -54,6 +57,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=sglang \
     +actor_rollout_ref.rollout.enable_partial_rollout=$pr_enable \
     +actor_rollout_ref.rollout.over_sampling_batch_size=$over_sampling_batch_size \
+    actor_rollout_ref.rollout.response_length=$rollout_max_response_length \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=$n_samples_per_prompt \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

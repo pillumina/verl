@@ -1420,7 +1420,14 @@ class SGLangRollout(BaseRollout):
         # Prepare responses
         responses = []
         for result in results:
-            response = result.get('response', torch.zeros(self.config.response_length, dtype=torch.long))
+            if 'response' not in result or result['response'] is None:
+                # Log warning for missing response instead of using zero tensor
+                logger.warning(f"Missing response in result: {result.get('request_id', 'unknown')}")
+                # Use a minimal fallback: single eos token or pad token
+                response = torch.tensor([self.pad_token_id], dtype=torch.long)
+            else:
+                response = result['response']
+
             # Pad to expected length if needed
             if len(response) < self.config.response_length:
                 response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
