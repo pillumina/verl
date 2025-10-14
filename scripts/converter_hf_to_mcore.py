@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+import threading
+import psutil
 import argparse
 import os
 import warnings
@@ -35,6 +38,7 @@ from megatron.core import dist_checkpointing
 from megatron.core import parallel_state as mpu
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.serialization import StrictHandling
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.models.gpt.gpt_model import ModelType
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from packaging.version import Version
@@ -62,6 +66,7 @@ def _init_args():
     parser.add_argument("--use_cpu_initialization", action="store_true", help="Whether to use cpu initialization")
     parser.add_argument("--test", action="store_true", help="Whether to test the conversion")
     parser.add_argument("--trust_remote_code", action="store_true", help="Whether to trust remote code")
+    parser.add_argument("--async_save", action="store_true", help="Whether to async save dist checkpoints")
     args = parser.parse_args()
     return args
 
@@ -399,19 +404,235 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(
     return numel
 
 
+@torch.inference_mode()
+def convert_checkpoint_from_transformers_to_megatron_bailing(
+    hf_model,
+    model,
+    hf_config,
+    layer_start_end: Optional[tuple[int, int]] = None,
+) -> int:
+    """
+    Convert HF BailingMoeV2 checkpoint to Megatron-Core format.
+    Supports pipeline parallelism via layer_start_end.
+    """
+    if layer_start_end is None:
+        layer_start_end = (0, len(model.decoder.layers))
+    layer_start, layer_end = layer_start_end
+
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    numel = 0
+
+    ref_state_dict = model.sharded_state_dict() 
+
+    use_qkv_bias = getattr(hf_config, "use_qkv_bias", False)
+
+    use_bias = getattr(hf_config, "use_bias", False)
+
+    use_qk_norm = getattr(hf_config, "use_qk_norm", False)
+
+    # 1. Embedding
+    if pp_rank == 0:
+        numel += safe_copy(hf_model.model.word_embeddings.weight,
+                           model.embedding.word_embeddings.weight)
+
+    # 2. Transformer layers
+    for layer_idx, (layer, hf_layer) in enumerate(
+        zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True),
+    ):
+        global_layer_idx = layer_idx + layer_start
+        numel_cur: int = numel
+
+        # ===== 打印当前层所有 key =====
+        current_keys = [k for k in ref_state_dict.keys() if f"decoder.layers.{global_layer_idx}." in k]
+        print(f"[PP{pp_rank}] layer={global_layer_idx}  keys={len(current_keys)}")
+        for k in current_keys:
+            print(f"  {k}")
+        # ===== 打印结束 =====
+
+        # 2-1 Attention (common)
+        numel += safe_copy(hf_layer.input_layernorm.weight, layer.self_attention.linear_qkv.layer_norm_weight)
+        qkv = hf_layer.attention.query_key_value.weight
+        numel += safe_copy(qkv, layer.self_attention.linear_qkv.weight)
+
+        if use_qkv_bias:
+            numel += safe_copy(hf_layer.query_key_value.bias, layer.self_attention.linear_qkv.bias)
+
+        numel += safe_copy(hf_layer.attention.dense.weight, layer.self_attention.linear_proj.weight)
+        
+        if use_bias:
+            numel += safe_copy(hf_layer.attention.dense.bias, layer.self_attention.linear_proj.bias)
+
+        if use_qk_norm:
+            numel += safe_copy(hf_layer.attention.key_layernorm.weight, layer.self_attention.k_layernorm.weight)
+            numel += safe_copy(hf_layer.attention.query_layernorm.weight, layer.self_attention.q_layernorm.weight)
+
+        # 2-2 FFN
+        if global_layer_idx < getattr(hf_config, "first_k_dense_replace", 1):
+            # Dense branch - copy post_attention_layernorm to linear_fc1.layer_norm_weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.mlp.linear_fc1.layer_norm_weight)
+            fc1 = torch.cat([hf_layer.mlp.gate_proj.weight,
+                             hf_layer.mlp.up_proj.weight], dim=0)
+            numel += safe_copy(fc1, layer.mlp.linear_fc1.weight)
+            numel += safe_copy(hf_layer.mlp.down_proj.weight,
+                               layer.mlp.linear_fc2.weight)
+        else:
+            # MoE branch - copy post_attention_layernorm to pre_mlp_layernorm.weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.pre_mlp_layernorm.weight)
+
+            # Handle experts based on moe_grouped_gemm setting
+            if hasattr(layer.mlp, 'experts') and hasattr(layer.mlp.experts, 'linear_fc1'):
+                # moe_grouped_gemm = True (grouped structure)
+                for i, hf_expert in enumerate(hf_layer.mlp.experts):
+                    fc1_weight = torch.cat([hf_expert.gate_proj.weight, hf_expert.up_proj.weight])
+                    linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    numel += safe_copy(fc1_weight, linear_fc1_weighti)
+                    linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    numel += safe_copy(hf_expert.down_proj.weight, linear_fc2_weighti)
+            else:
+                # moe_grouped_gemm = False (local_experts structure)
+                for i in range(hf_config.num_experts):
+                    # todo: 改成聚集的形式
+                    fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight, hf_layer.mlp.experts[i].up_proj.weight])
+                    # linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    # numel += safe_copy(fc1, linear_fc1_weighti)
+
+                    fc2 = hf_layer.mlp.experts[i].down_proj.weight 
+                    # linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    # numel += safe_copy(fc2, linear_fc2_weighti)
+
+                    numel += safe_copy(fc1,
+                                       layer.mlp.experts.local_experts[i].linear_fc1.weight)
+                    numel += safe_copy(fc2,
+                                       layer.mlp.experts.local_experts[i].linear_fc2.weight)
+
+            shared_fc1 = torch.cat([hf_layer.mlp.shared_experts.gate_proj.weight,
+                                    hf_layer.mlp.shared_experts.up_proj.weight], dim=0)
+            numel += safe_copy(shared_fc1, layer.mlp.shared_experts.linear_fc1.weight)
+            numel += safe_copy(hf_layer.mlp.shared_experts.down_proj.weight,
+                               layer.mlp.shared_experts.linear_fc2.weight)
+
+            numel += safe_copy(hf_layer.mlp.gate.weight, layer.mlp.router.weight)
+            numel += safe_copy(hf_layer.mlp.gate.expert_bias,
+                               layer.mlp.router.expert_bias,
+                               skip_dtype_assert=True)
+                               
+        assert numel - numel_cur == sum([i.numel() for i in hf_layer.state_dict().values()]), "numel mismatch"
+        print(f"PP{pp_rank}  layer={global_layer_idx}  total={numel}")
+
+    # 3. Final norm + LM head
+    if pp_rank == pp_size - 1:
+        numel += safe_copy(hf_model.model.norm.weight,
+                           model.decoder.final_layernorm.weight)
+        if not getattr(hf_config, "tie_word_embeddings", False):
+            numel += safe_copy(hf_model.lm_head.weight,
+                               model.output_layer.weight)
+
+    return numel
+
+
 @contextmanager
 def noop_context() -> Any:
     yield
 
 
 def support_distributed_convert(hf_config: AutoConfig) -> bool:
-    for arch in ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen2MoeForCausalLM"]:
+    for arch in ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen2MoeForCausalLM", "BailingMoeV2ForCausalLM"]:
         if arch in hf_config.architectures:
             return True
     return False
 
 
-def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False, test=False, trust_remote_code=False):
+def get_memory_usage():
+    """获取当前内存使用情况（以GB为单位）"""
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_gb = memory_info.rss / 1024 / 1024 / 1024
+        return memory_gb
+    except ImportError:
+        print("psutil not available, using basic memory monitoring", flush=True)
+        return None
+    except Exception as e:
+        print(f"Error getting memory usage: {e}", flush=True)
+        return None
+
+def print_memory_usage(stage, use_cpu_initialization=False):
+    """打印当前内存使用情况"""
+    pid = os.getpid()
+    memory_gb = get_memory_usage()
+    if memory_gb is not None:
+        print(f"[MEMORY] {stage}: {memory_gb:.2f} GB, pid: {pid}", flush=True)
+
+    # 设备内存监控
+    if not use_cpu_initialization:
+        try:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[CUDA] Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB", flush=True)
+        except Exception:
+            pass
+
+def aggressive_memory_cleanup(use_cpu_initialization=False):
+    """内存清理并监控效果"""
+    print_memory_usage("Before cleanup", use_cpu_initialization)
+
+    import gc
+    gc.collect()
+
+    try:
+        if not use_cpu_initialization and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif not use_cpu_initialization and hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.empty_cache()
+    except Exception as e:
+        print(f"failed to empty cache: {e}", flush=True)
+
+    print_memory_usage("After cleanup", use_cpu_initialization)
+
+
+def start_simple_memory_monitor():
+      """启动最简单的内存监控线程"""
+
+      def simple_monitor():
+          try:
+              current_pid = os.getpid()
+              process = psutil.Process(current_pid)
+
+              print("[MONITOR] Memory monitoring started", flush=True)
+
+              while not hasattr(threading.current_thread(), 'stop_monitor'):
+                  # 获取内存信息
+                  memory_info = process.memory_info()
+                  rss_gb = memory_info.rss / 1024 / 1024 / 1024
+                  cpu_percent = process.cpu_percent()
+
+                  print(f"[MONITOR] {time.strftime('%H:%M:%S')} | RSS: {rss_gb:.2f}GB | CPU: {cpu_percent:.1f}%", flush=True)
+
+                  # 短暂睡眠
+                  time.sleep(2)
+
+          except Exception as e:
+              print(f"[MONITOR] Error: {e}", flush=True)
+
+      # 启动监控线程
+      monitor_thread = threading.Thread(target=simple_monitor, name="MemoryMonitor", daemon=True)
+      monitor_thread.start()
+
+      return monitor_thread
+
+def stop_simple_memory_monitor(monitor_thread):
+      """停止内存监控线程"""
+      if monitor_thread and monitor_thread.is_alive():
+          print("[MONITOR] Stopping memory monitor...", flush=True)
+          # 标记停止标志
+          threading.current_thread().stop_monitor = True
+          monitor_thread.join(timeout=5)
+
+
+def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False, test=False, trust_remote_code=False, async_save=False):
     os.makedirs(output_path, exist_ok=True)
     if len(os.listdir(output_path)) > 0 and not test:
         print(f"Output path {output_path} is not empty, skipping conversion")
@@ -441,7 +662,7 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
     model_parallel_cuda_manual_seed(0)
 
     # init hf config
-    hf_config = AutoConfig.from_pretrained(hf_model_path)
+    hf_config = AutoConfig.from_pretrained(hf_model_path, trust_remote_code=trust_remote_code)
     print(hf_config, flush=True)
 
     if world_size > 1 and not support_distributed_convert(hf_config):
@@ -491,6 +712,8 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
     # init hf model
+    print_memory_usage("Before HF model loading", use_cpu_initialization)
+
     if "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
         hf_model = AutoModelForImageTextToText.from_pretrained(
             hf_model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
@@ -499,7 +722,16 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
         hf_model = AutoModelForCausalLM.from_pretrained(
             hf_model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
         )
+
+    print_memory_usage("After HF model loaded", use_cpu_initialization)
+
     hf_state_dict = hf_model.state_dict()
+    print_memory_usage("After HF state_dict created", use_cpu_initialization)
+
+    # 打印HF模型信息
+    total_params = sum(p.numel() for p in hf_model.parameters())
+    print(f"[HF MODEL] Total parameters: {total_params/1e12:.2f}T")
+    print(f"[HF MODEL] Model size (bfloat16): {total_params * 2 / 1024**3:.2f} GB")
 
     # distributed convert
     if world_size > 1 and support_distributed_convert(hf_config):
@@ -514,6 +746,14 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
             numel_partial: int = convert_checkpoint_from_transformers_to_megatron(
                 hf_model, model[0].module, hf_config, layer_start_end=(layer_start, layer_end)
             )
+        elif "BailingMoeV2ForCausalLM" in hf_config.architectures:
+            print_memory_usage("Before BailingMoeV2 conversion", use_cpu_initialization)
+
+            numel_partial: int = convert_checkpoint_from_transformers_to_megatron_bailing(
+                hf_model, model[0].module, hf_config, layer_start_end=(layer_start, layer_end)
+                )
+
+            print_memory_usage("After BailingMoeV2 conversion", use_cpu_initialization)
         else:
             raise NotImplementedError(f"Distributed conversion is not supported for {hf_config.architectures} yet.")
 
@@ -533,6 +773,8 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
         convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model[0].module, hf_config, tfconfig=tfconfig)
     elif "Qwen3MoeForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron(hf_model, model[0].module, hf_config)
+    elif "BailingMoeV2ForCausalLM" in hf_config.architectures:
+        convert_checkpoint_from_transformers_to_megatron_bailing(hf_model, model[0].module, hf_config)
     else:
         assert not use_cpu_initialization, "use_cpu_initialization is only supported for MoE model"
         from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
@@ -545,18 +787,53 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
             is_value_model=False,
         )
 
+    print_memory_usage("Before sharded_state_dict creation", use_cpu_initialization)
+
     megatron_state_dict = model[0].module.sharded_state_dict()
+    print_memory_usage("After sharded_state_dict created", use_cpu_initialization)
+
+    print("Starting cleanup of HF models...", flush=True)
     del hf_state_dict, hf_model
 
+    aggressive_memory_cleanup(use_cpu_initialization=use_cpu_initialization)
+    print_memory_usage("After HF models deleted", use_cpu_initialization)
+
     # save megatron model
-    if len(os.listdir(output_path)) == 0:
-        dist_checkpointing.save(megatron_state_dict, output_path, sharded_strategy=None, async_sharded_save=False)
+    # remove the target directory containing check for multi-procs / multi-nodes conversion cases.
+    print_memory_usage("Before dist_checkpointing.save", use_cpu_initialization)
+    sharded_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=1)
+    if not async_save:
+        print("Starting sync dist_checkpointing.save...", flush=True)
+        memory_monitor_thread = start_simple_memory_monitor()
+        dist_checkpointing.save(megatron_state_dict, output_path, sharded_strategy=sharded_strategy, async_sharded_save=False, validate_access_integrity=False)
+        stop_simple_memory_monitor(memory_monitor_thread)
+        print_memory_usage("After sync dist_checkpointing.save", use_cpu_initialization)
+    else:
+        print("Starting async dist_checkpointing.save...", flush=True)
+        is_done = False
+        def done_callback():
+            # to modify outer variable
+            nonlocal is_done
+            print("Async checkpoints saving finish successfully")
+            is_done = True
+        async_request = dist_checkpointing.save(megatron_state_dict, output_path, sharded_strategy=sharded_strategy, async_sharded_save=True, validate_access_integrity=False)
+        async_request.add_finalize_fn(done_callback)
+        print("Async save started, waiting for completion...")
+        while not is_done:
+            print_memory_usage("Waiting fo async save complete", use_cpu_initialization)
+            time.sleep(5) 
+        print_memory_usage("After async dist_checkpointing.save", use_cpu_initialization)
+
+    print("dist_checkpointing.save completed!", flush=True)
+
     if test:
+        print_memory_usage("Before test_conversion", use_cpu_initialization)
         test_conversion(megatron_model_provider, tfconfig, output_path, model)
+        print_memory_usage("After test_conversion", use_cpu_initialization)
 
 
 if __name__ == "__main__":
     args = _init_args()
     convert_hf_to_mcore(
-        args.hf_model_path, args.output_path, args.use_cpu_initialization, args.test, args.trust_remote_code
+        args.hf_model_path, args.output_path, args.use_cpu_initialization, args.test, args.trust_remote_code, args.async_save
     )

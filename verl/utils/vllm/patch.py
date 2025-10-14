@@ -17,6 +17,12 @@
 SUPPORTED_MOE_MODELS = []
 
 try:
+    from vllm_ascend.models.bailing_moe_v2 import BailingMoeV2ForCausalLM
+    SUPPORTED_MOE_MODELS.append(BailingMoeV2ForCausalLM)
+except ImportError:
+    pass
+
+try:
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 
     SUPPORTED_MOE_MODELS.append(DeepseekV2ForCausalLM)

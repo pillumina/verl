@@ -737,6 +737,7 @@ def default_tp_concat_fn(
     model_config,
     hf_config=None,
     convert_qkv_gate_up_by_simple_split=False,
+    uniform_gather=False,
 ):
     """
     name: name of the parameter
@@ -751,6 +752,44 @@ def default_tp_concat_fn(
 
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
+
+        # EXPERIMENTAL: Test uniform TP sharding handling
+        # This assumes each TP shard gets a uniform portion of the full QKV tensor
+        # instead of being pre-split by Q:K:V ratio
+        if uniform_gather:  # Enable this experimental branch
+            # If infer_params has uniform shards, just concatenate them directly
+            print(f"executing uniform tp shards gathered concatination", flush=True)
+            if len(infer_params) > 1:
+                # Multiple shards - concatenate them to get full QKV
+                experimental_result = torch.cat(infer_params, dim=0)
+
+                convert_qkv_gate_up_by_simple_split = False
+
+                # For convert_qkv_gate_up_by_simple_split=True, we need to return [q, k, v]
+                if convert_qkv_gate_up_by_simple_split:
+                    # Split the full QKV into Q, K, V using the correct ratio
+                    num_attention_heads = model_config.num_attention_heads
+                    num_key_value_heads = model_config.num_key_value_heads
+                    total_qkv_dim = experimental_result.shape[0]
+
+                    # Calculate expected dimensions
+                    head_dim = model_config.hidden_size // num_attention_heads
+                    q_dim = num_attention_heads * head_dim
+                    k_dim = num_key_value_heads * head_dim
+                    v_dim = num_key_value_heads * head_dim
+
+                    # Split the concatenated tensor
+                    q, k, v = experimental_result.split([q_dim, k_dim, v_dim], dim=0)
+                    experimental_result = [q, k, v]
+                else:
+                    # For convert_qkv_gate_up_by_simple_split=False, return concatenated tensor directly
+                    print(f"convert_qkv_gate_up_by_simple_split=False, returning concatenated QKV tensor", flush=True)
+                    print(f"Final experimental result shape: {experimental_result.shape}", flush=True)
+
+                return experimental_result
+            else:
+                return infer_params[0]
+
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
         q_lst = []
@@ -784,7 +823,6 @@ def default_tp_concat_fn(
         k = torch.cat(k_lst, dim=0)
         v = torch.cat(v_lst, dim=0)
         infer_params = torch.cat((q, k, v), dim=0) if not convert_qkv_gate_up_by_simple_split else [q, k, v]
-
     elif (
         layer_name_mapping.get("gate_proj_layer_name") in name
         and "layer_norm" not in name
@@ -803,7 +841,6 @@ def default_tp_concat_fn(
 
     elif "mlp.experts.linear_fc2.weight" in name:  # moe
         infer_params = torch.cat(infer_params, dim=1)
-
     else:
         # concat tensor
         infer_params = torch.cat(infer_params, dim=tp_utils.get_tensor_parallel_partition_dim(train_params))
@@ -864,6 +901,11 @@ def per_tensor_generator(
     layer_list_meta = [item for sublist in obj_spec_output for item in sublist]
 
     gen_func = tensor_generator()
+
+    # todo: workaroud for qkv weight concatination case, need refactory 
+    is_bailing_moe_arc = weight_converter.__class__.__name__ == "McoreToHFWeightConverterBailingMoeV2"
+    if is_bailing_moe_arc:
+        print(f"per_tensor_generated detected BailingMoeV2 architecture", flush=True)
 
     # lazy load tensor for full model
     for cur_pp_rank, scan_vpp_idx, idx, name in layer_list_meta:
@@ -937,6 +979,7 @@ def per_tensor_generator(
             else:
                 infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
                 torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
+
             infer_params = default_tp_concat_fn(
                 layer_name_mapping,
                 cur_name,
@@ -945,7 +988,9 @@ def per_tensor_generator(
                 model_config,
                 weight_converter.hf_config,
                 convert_qkv_gate_up_by_simple_split,
+                uniform_gather=True if is_bailing_moe_arc else False
             )
+            # print(f"[debug] tp all gather for name: [{cur_name}] with infer params len: [{len(infer_params)}]")
         else:
             infer_params = broad_pp_tensor
 

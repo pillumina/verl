@@ -32,6 +32,7 @@ from .config_converter import (
     hf_to_mcore_config_qwen2_5_vl,
     hf_to_mcore_config_qwen2moe,
     hf_to_mcore_config_qwen3moe,
+    hf_to_mcore_config_bailing_moe_v2,
 )
 from .model_forward import (
     gptmodel_forward,
@@ -49,6 +50,7 @@ from .model_initializer import (
     Qwen2MoEModel,
     Qwen3MoEModel,
     Qwen25VLModel,
+    BailingMoeV2Model,
 )
 from .weight_converter import (
     McoreToHFWeightConverterDense,
@@ -57,6 +59,7 @@ from .weight_converter import (
     McoreToHFWeightConverterQwen2_5_VL,
     McoreToHFWeightConverterQwen2Moe,
     McoreToHFWeightConverterQwen3Moe,
+    McoreToHFWeightConverterBailingMoeV2,
 )
 
 
@@ -71,6 +74,7 @@ class SupportedModel(Enum):
     QWEN3 = "Qwen3ForCausalLM"  # tested
     QWEN3_MOE = "Qwen3MoeForCausalLM"  # tested
     GLM4_MOE = "Glm4MoeForCausalLM"
+    BAILING_MOE_V2 = "BailingMoeV2ForCausalLM" # not tested
 
     QWEN3_TOKEN_CLASSIFICATION = "Qwen3ForTokenClassification"
 
@@ -88,6 +92,7 @@ MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig
     SupportedModel.QWEN3_MOE: hf_to_mcore_config_qwen3moe,
     SupportedModel.QWEN2_5_VL: hf_to_mcore_config_qwen2_5_vl,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: hf_to_mcore_config_dense,
+    SupportedModel.BAILING_MOE_V2: hf_to_mcore_config_bailing_moe_v2,
 }
 
 # Registry for model initializers
@@ -103,6 +108,7 @@ MODEL_INITIALIZER_REGISTRY: dict[SupportedModel, type[BaseModelInitializer]] = {
     SupportedModel.QWEN3_MOE: Qwen3MoEModel,
     SupportedModel.QWEN2_5_VL: Qwen25VLModel,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: DenseModel,
+    SupportedModel.BAILING_MOE_V2: BailingMoeV2Model,
 }
 
 # Registry for model forward functions
@@ -120,9 +126,31 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.DEEPSEEK_V3: gptmodel_forward,
     SupportedModel.GLM4_MOE: gptmodel_forward,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: gptmodel_forward,
+    SupportedModel.BAILING_MOE_V2: gptmodel_forward, # todo: need check
 }
 
 # Registry for model forward functions
+# <<<<<<< HEAD
+# =======
+# MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
+#     SupportedModel.LLAMA: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN2: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN2_MOE: gptmodel_forward_no_padding,
+#     SupportedModel.MIXTRAL: gptmodel_forward_no_padding,
+#     SupportedModel.DEEPSEEK_V3: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN2_5_VL: gptmodel_forward_no_padding,
+#     SupportedModel.LLAMA4: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN3: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN3_MOE: gptmodel_forward_no_padding,
+#     # SupportedModel.QWEN2_5_VL: gptmodel_forward_qwen2_5_vl,
+#     SupportedModel.DEEPSEEK_V3: gptmodel_forward_no_padding,
+#     SupportedModel.GLM4_MOE: gptmodel_forward_no_padding,
+#     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: gptmodel_forward_no_padding,
+#     SupportedModel.BAILING_MOE_V2: gptmodel_forward_no_padding, # todo: need check
+# }
+
+# # Registry for model forward functions
+# >>>>>>> ad44a904... feat: add BailingMoeV2ForCausalLM mcore support
 MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA: fused_forward_gptmodel,
     SupportedModel.QWEN2: fused_forward_gptmodel,
@@ -136,6 +164,7 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.QWEN2_5_VL: fused_forward_qwen2_5_vl,
     SupportedModel.DEEPSEEK_V3: fused_forward_gptmodel,
     SupportedModel.GLM4_MOE: fused_forward_gptmodel,
+    SupportedModel.BAILING_MOE_V2: fused_forward_gptmodel, # todo: need check
 }
 
 # Registry for model weight converters
@@ -149,6 +178,7 @@ MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
     SupportedModel.QWEN3_MOE: McoreToHFWeightConverterQwen3Moe,
     SupportedModel.QWEN2_5_VL: McoreToHFWeightConverterQwen2_5_VL,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: McoreToHFWeightConverterDense,
+    SupportedModel.BAILING_MOE_V2: McoreToHFWeightConverterBailingMoeV2,
 }
 
 
