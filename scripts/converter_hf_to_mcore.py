@@ -399,13 +399,140 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(
     return numel
 
 
+@torch.inference_mode()
+def convert_checkpoint_from_transformers_to_megatron_bailing(
+    hf_model,
+    model,
+    hf_config,
+    layer_start_end: Optional[tuple[int, int]] = None,
+) -> int:
+    """
+    Convert HF BailingMoeV2 checkpoint to Megatron-Core format.
+    Supports pipeline parallelism via layer_start_end.
+    """
+    if layer_start_end is None:
+        layer_start_end = (0, len(model.decoder.layers))
+    layer_start, layer_end = layer_start_end
+
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    numel = 0
+
+    ref_state_dict = model.sharded_state_dict() 
+
+    use_qkv_bias = getattr(hf_config, "use_qkv_bias", False)
+
+    use_bias = getattr(hf_config, "use_bias", False)
+
+    use_qk_norm = getattr(hf_config, "use_qk_norm", False)
+
+    # 1. Embedding
+    if pp_rank == 0:
+        numel += safe_copy(hf_model.model.word_embeddings.weight,
+                           model.embedding.word_embeddings.weight)
+
+    # 2. Transformer layers
+    for layer_idx, (layer, hf_layer) in enumerate(
+        zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True),
+    ):
+        global_layer_idx = layer_idx + layer_start
+        numel_cur: int = numel
+
+        # ===== 打印当前层所有 key =====
+        current_keys = [k for k in ref_state_dict.keys() if f"decoder.layers.{global_layer_idx}." in k]
+        print(f"[PP{pp_rank}] layer={global_layer_idx}  keys={len(current_keys)}")
+        for k in current_keys:
+            print(f"  {k}")
+        # ===== 打印结束 =====
+
+        # 2-1 Attention (common)
+        numel += safe_copy(hf_layer.input_layernorm.weight, layer.self_attention.linear_qkv.layer_norm_weight)
+        qkv = hf_layer.attention.query_key_value.weight
+        numel += safe_copy(qkv, layer.self_attention.linear_qkv.weight)
+
+        if use_qkv_bias:
+            numel += safe_copy(hf_layer.query_key_value.bias, layer.self_attention.linear_qkv.bias)
+
+        numel += safe_copy(hf_layer.attention.dense.weight, layer.self_attention.linear_proj.weight)
+        
+        if use_bias:
+            numel += safe_copy(hf_layer.attention.dense.bias, layer.self_attention.linear_proj.bias)
+
+        if use_qk_norm:
+            numel += safe_copy(hf_layer.attention.key_layernorm.weight, layer.self_attention.k_layernorm.weight)
+            numel += safe_copy(hf_layer.attention.query_layernorm.weight, layer.self_attention.q_layernorm.weight)
+
+        # 2-2 FFN
+        if global_layer_idx < getattr(hf_config, "first_k_dense_replace", 1):
+            # Dense branch - copy post_attention_layernorm to linear_fc1.layer_norm_weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.mlp.linear_fc1.layer_norm_weight)
+            fc1 = torch.cat([hf_layer.mlp.gate_proj.weight,
+                             hf_layer.mlp.up_proj.weight], dim=0)
+            numel += safe_copy(fc1, layer.mlp.linear_fc1.weight)
+            numel += safe_copy(hf_layer.mlp.down_proj.weight,
+                               layer.mlp.linear_fc2.weight)
+        else:
+            # MoE branch - copy post_attention_layernorm to pre_mlp_layernorm.weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.pre_mlp_layernorm.weight)
+
+            # Handle experts based on moe_grouped_gemm setting
+            if hasattr(layer.mlp, 'experts') and hasattr(layer.mlp.experts, 'linear_fc1'):
+                # moe_grouped_gemm = True (grouped structure)
+                for i, hf_expert in enumerate(hf_layer.mlp.experts):
+                    fc1_weight = torch.cat([hf_expert.gate_proj.weight, hf_expert.up_proj.weight])
+                    linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    numel += safe_copy(fc1_weight, linear_fc1_weighti)
+                    linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    numel += safe_copy(hf_expert.down_proj.weight, linear_fc2_weighti)
+            else:
+                # moe_grouped_gemm = False (local_experts structure)
+                for i in range(hf_config.num_experts):
+                    # todo: 改成聚集的形式
+                    fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight, hf_layer.mlp.experts[i].up_proj.weight])
+                    # linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    # numel += safe_copy(fc1, linear_fc1_weighti)
+
+                    fc2 = hf_layer.mlp.experts[i].down_proj.weight 
+                    # linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    # numel += safe_copy(fc2, linear_fc2_weighti)
+
+                    numel += safe_copy(fc1,
+                                       layer.mlp.experts.local_experts[i].linear_fc1.weight)
+                    numel += safe_copy(fc2,
+                                       layer.mlp.experts.local_experts[i].linear_fc2.weight)
+
+            shared_fc1 = torch.cat([hf_layer.mlp.shared_experts.gate_proj.weight,
+                                    hf_layer.mlp.shared_experts.up_proj.weight], dim=0)
+            numel += safe_copy(shared_fc1, layer.mlp.shared_experts.linear_fc1.weight)
+            numel += safe_copy(hf_layer.mlp.shared_experts.down_proj.weight,
+                               layer.mlp.shared_experts.linear_fc2.weight)
+
+            numel += safe_copy(hf_layer.mlp.gate.weight, layer.mlp.router.weight)
+            numel += safe_copy(hf_layer.mlp.gate.expert_bias,
+                               layer.mlp.router.expert_bias,
+                               skip_dtype_assert=True)
+                               
+        assert numel - numel_cur == sum([i.numel() for i in hf_layer.state_dict().values()]), "numel mismatch"
+        print(f"PP{pp_rank}  layer={global_layer_idx}  total={numel}")
+
+    # 3. Final norm + LM head
+    if pp_rank == pp_size - 1:
+        numel += safe_copy(hf_model.model.norm.weight,
+                           model.decoder.final_layernorm.weight)
+        if not getattr(hf_config, "tie_word_embeddings", False):
+            numel += safe_copy(hf_model.lm_head.weight,
+                               model.output_layer.weight)
+
+    return numel
+
+
 @contextmanager
 def noop_context() -> Any:
     yield
 
 
 def support_distributed_convert(hf_config: AutoConfig) -> bool:
-    for arch in ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen2MoeForCausalLM"]:
+    for arch in ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen2MoeForCausalLM", "BailingMoeV2ForCausalLM"]:
         if arch in hf_config.architectures:
             return True
     return False
@@ -514,6 +641,10 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
             numel_partial: int = convert_checkpoint_from_transformers_to_megatron(
                 hf_model, model[0].module, hf_config, layer_start_end=(layer_start, layer_end)
             )
+        elif "BailingMoeV2ForCausalLM" in hf_config.architectures:
+            numel_partial: int = convert_checkpoint_from_transformers_to_megatron_bailing(
+                hf_model, model[0].module, hf_config, layer_start_end=(layer_start, layer_end)
+                )
         else:
             raise NotImplementedError(f"Distributed conversion is not supported for {hf_config.architectures} yet.")
 
@@ -533,6 +664,8 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
         convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model[0].module, hf_config, tfconfig=tfconfig)
     elif "Qwen3MoeForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron(hf_model, model[0].module, hf_config)
+    elif "BailingMoeV2ForCausalLM" in hf_config.architectures:
+        convert_checkpoint_from_transformers_to_megatron_bailing(hf_model, model[0].module, hf_config)
     else:
         assert not use_cpu_initialization, "use_cpu_initialization is only supported for MoE model"
         from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel

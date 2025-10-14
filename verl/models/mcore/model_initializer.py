@@ -274,3 +274,29 @@ class Qwen25VLModel(BaseModelInitializer):
             )
 
         return qwen25_vl_model
+
+
+class BailingMoeV2Model(BaseModelInitializer):
+    """Initializer for Ring/Ling MoE models."""
+
+    def get_transformer_layer_spec(self, vp_stage=None):
+        assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
+        extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
+        transformer_layer_spec = get_gpt_decoder_block_spec(
+            self.tfconfig, use_transformer_engine=True, **extra_kwargs
+        )
+        # Bailing 共享 expert 也需要 gate
+        # for spec in transformer_layer_spec.layer_specs:
+        #     spec.submodules.mlp.submodules.shared_experts.params["gate"] = True
+        return transformer_layer_spec
+
+    def initialize(self, **kwargs):
+        model = super().initialize(**kwargs)
+        freeze_moe_router = kwargs.get("freeze_moe_router", True)
+        if freeze_moe_router:
+            # align with deepv3?
+            self.tfconfig.moe_router_load_balancing_type = "none"
+            for layer in model.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router.weight.requires_grad = False
+        return model

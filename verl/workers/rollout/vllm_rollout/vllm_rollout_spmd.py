@@ -204,6 +204,12 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            additional_config={
+                "ascend_scheduler_config": {
+                    "enabled": False,
+                    "enable_chunked_prefill": True
+                }
+            },
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
@@ -337,12 +343,36 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            self.sampling_params.detokenize = True
+            rank = torch.distributed.get_rank()
+            # print(f'rank {rank} generate with vllm inputs: {vllm_inputs}', flush=True)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
+            try:
+                rank = torch.distributed.get_rank()
+                if rank == 0: #* 只打印 rank0 的
+                    for output in outputs:
+                        #* 写死的，只打印 1 份
+                        #* 只打印部分
+                        print_n_gen = 1 # len(output.outputs)
+                        for sample_id in range(print_n_gen):
+                            response_text = output.outputs[sample_id].text
+                            print(f"===>Output===>", flush=True)
+                            if len(response_text) <= 820:
+                                print(response_text, flush=True)
+                            else:
+                                print(response_text[:400], flush=True)
+                                print("\n...\n...\n", flush=True)
+                                print(response_text[-400:], flush=True)
+
+                            print(f"<===END, 生成结束原因: {output.outputs[sample_id].finish_reason}", flush=True)
+
+            except Exception as e:
+                print(f"Print generation failed! \nreason is {e.__repr__()}")
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)

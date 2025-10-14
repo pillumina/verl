@@ -749,10 +749,97 @@ def default_tp_concat_fn(
     """
     from megatron.core import mpu
 
+    print(f"************ Enter default_tp_concat_fn with name: {name}******************", flush=True)
+
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
+
+        # EXPERIMENTAL: Test uniform TP sharding handling
+        # This assumes each TP shard gets a uniform portion of the full QKV tensor
+        # instead of being pre-split by Q:K:V ratio
+        if True:  # Enable this experimental branch
+            print(f"************ Enter EXPERIMENTAL uniform sharding branch", flush=True)
+            print(f"DEBUG: Experimental branch - treating infer_params as uniform shards", flush=True)
+
+            # If infer_params has uniform shards, just concatenate them directly
+            if len(infer_params) > 1:
+                # Multiple shards - concatenate them to get full QKV
+                experimental_result = torch.cat(infer_params, dim=0)
+                print(f"DEBUG: Experimental concatenated shape: {experimental_result.shape}", flush=True)
+
+                # Print statistics for concatenated weight tensor
+                print(f"DEBUG: Concatenated tensor statistics for layer: {name}", flush=True)
+                print(f"DEBUG:   Mean: {experimental_result.mean().item():.6f}", flush=True)
+                print(f"DEBUG:   Std:  {experimental_result.std().item():.6f}", flush=True)
+                print(f"DEBUG:   Min:  {experimental_result.min().item():.6f}", flush=True)
+                print(f"DEBUG:   Max:  {experimental_result.max().item():.6f}", flush=True)
+                print(f"DEBUG:   Data type: {experimental_result.dtype}", flush=True)
+
+                # Check first few and last few values (similar to inspect_src_qkv_tensors)
+                flat_tensor = experimental_result.view(-1)
+                total_elements = flat_tensor.shape[0]
+                print(f"DEBUG:   First 5 values: {flat_tensor[:5].tolist()}", flush=True)
+                print(f"DEBUG:   Last 5 values: {flat_tensor[-5:].tolist()}", flush=True)
+
+                # Check for patterns that might indicate rank-based distribution
+                if experimental_result.shape[0] >= 4:  # At least 4 rows to analyze
+                    row_means = experimental_result.mean(dim=1)  # Mean of each row
+                    print(f"DEBUG:   Row means - First 3: {row_means[:3].tolist()}", flush=True)
+                    print(f"DEBUG:   Row means - Last 3: {row_means[-3:].tolist()}", flush=True)
+
+                    # Also check middle section for potential rank boundaries
+                    mid_point = experimental_result.shape[0] // 2
+                    print(f"DEBUG:   Row means at mid point ({mid_point}): {row_means[mid_point-1:mid_point+2].tolist()}", flush=True)
+
+                convert_qkv_gate_up_by_simple_split = False
+
+                # For convert_qkv_gate_up_by_simple_split=True, we need to return [q, k, v]
+                if convert_qkv_gate_up_by_simple_split:
+                    # Split the full QKV into Q, K, V using the correct ratio
+                    num_attention_heads = model_config.num_attention_heads
+                    num_key_value_heads = model_config.num_key_value_heads
+                    total_qkv_dim = experimental_result.shape[0]
+
+                    # Calculate expected dimensions
+                    head_dim = model_config.hidden_size // num_attention_heads
+                    q_dim = num_attention_heads * head_dim
+                    k_dim = num_key_value_heads * head_dim
+                    v_dim = num_key_value_heads * head_dim
+
+                    print(f"DEBUG: Expected QKV dims - Q:{q_dim}, K:{k_dim}, V:{v_dim}, Total:{q_dim+k_dim+v_dim}", flush=True)
+
+                    # Split the concatenated tensor
+                    q, k, v = experimental_result.split([q_dim, k_dim, v_dim], dim=0)
+                    experimental_result = [q, k, v]
+                    print(f"DEBUG: Experimental QKV shapes - Q:{q.shape}, K:{k.shape}, V:{v.shape}", flush=True)
+                else:
+                    # For convert_qkv_gate_up_by_simple_split=False, return concatenated tensor directly
+                    print(f"DEBUG: convert_qkv_gate_up_by_simple_split=False, returning concatenated QKV tensor", flush=True)
+                    print(f"DEBUG: Final experimental result shape: {experimental_result.shape}", flush=True)
+
+                print(f"DEBUG: Using experimental result instead of original logic", flush=True)
+                return experimental_result
+            else:
+                print(f"DEBUG: Single tensor in infer_params, returning as-is", flush=True)
+                return infer_params[0]
+        print(f"************ Enter branch 1 with name: {name}", flush=True)
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
+
+        # Debug: Save original infer_params for comparison
+        original_infer_param = infer_params[0].clone() if hasattr(infer_params[0], 'clone') else infer_params[0]
+        print(f"DEBUG: Original infer_param shape: {original_infer_param.shape}", flush=True)
+        print(f"DEBUG: train_tp_size: {train_tp_size}", flush=True)
+        print(f"DEBUG: infer_params length: {len(infer_params)}", flush=True)
+        print(f"DEBUG: infer_params shapes: {[p.shape for p in infer_params]}", flush=True)
+
+        # Check if infer_params contains TP shards or full tensors
+        total_elements = sum(p.shape[0] for p in infer_params)
+        print(f"DEBUG: Total elements in infer_params: {total_elements}", flush=True)
+        if total_elements == original_infer_param.shape[0] * len(infer_params):
+            print(f"DEBUG: infer_params contains TP shards (consistent with TP size)", flush=True)
+        else:
+            print(f"DEBUG: infer_params contains mixed/inconsistent data!", flush=True)
         q_lst = []
         k_lst = []
         v_lst = []
@@ -785,11 +872,43 @@ def default_tp_concat_fn(
         v = torch.cat(v_lst, dim=0)
         infer_params = torch.cat((q, k, v), dim=0) if not convert_qkv_gate_up_by_simple_split else [q, k, v]
 
+        # Debug: Compare original vs processed
+        print(f"DEBUG: convert_qkv_gate_up_by_simple_split: {convert_qkv_gate_up_by_simple_split}", flush=True)
+        print(f"DEBUG: num_q_per_kv: {num_q_per_kv}", flush=True)
+        print(f"DEBUG: kv_size_per_tp: {kv_size_per_tp}", flush=True)
+        print(f"DEBUG: split_size: {[kv_size_per_tp * num_q_per_kv, kv_size_per_tp, kv_size_per_tp]}", flush=True)
+        print(f"DEBUG: num_query_groups_per_partition: {num_query_groups_per_partition}", flush=True)
+
+        if convert_qkv_gate_up_by_simple_split:
+            # When True, infer_params is [q, k, v] list
+            print(f"DEBUG: Processed infer_params type: list, shapes: {[p.shape for p in infer_params]}", flush=True)
+            # For comparison, re-concatenate the split tensors
+            reconcatenated = torch.cat(infer_params, dim=0)
+            print(f"DEBUG: Re-concatenated shape: {reconcatenated.shape}", flush=True)
+
+            # Check if split introduces precision issues
+            are_equal = torch.allclose(original_infer_param, reconcatenated, atol=1e-6)
+            max_diff = torch.max(torch.abs(original_infer_param - reconcatenated)).item()
+            print(f"DEBUG: Original vs Re-concatenated are equal: {are_equal}", flush=True)
+            print(f"DEBUG: Max difference: {max_diff}", flush=True)
+            if not are_equal:
+                print(f"DEBUG: WARNING - Split operation introduced precision differences!", flush=True)
+        else:
+            # When False, infer_params is concatenated tensor
+            print(f"DEBUG: Processed infer_params shape: {infer_params.shape}", flush=True)
+            are_equal = torch.allclose(original_infer_param, infer_params, atol=1e-6)
+            max_diff = torch.max(torch.abs(original_infer_param - infer_params)).item()
+            print(f"DEBUG: Original vs Processed are equal: {are_equal}", flush=True)
+            print(f"DEBUG: Max difference: {max_diff}", flush=True)
+            if not are_equal:
+                print(f"DEBUG: WARNING - Split-cat operation introduced precision differences!", flush=True)
+
     elif (
         layer_name_mapping.get("gate_proj_layer_name") in name
         and "layer_norm" not in name
         and "vision_model.projection" not in name
     ):
+        print(f"************ Enter branch 2 with name: {name}", flush=True)
         # if the tensor is gate and proj
         gate_lst = []
         up_lst = []
@@ -802,9 +921,11 @@ def default_tp_concat_fn(
         infer_params = torch.cat((gate, up), dim=0) if not convert_qkv_gate_up_by_simple_split else [gate, up]
 
     elif "mlp.experts.linear_fc2.weight" in name:  # moe
+        print(f"************ Enter branch 3 with name: {name}", flush=True)
         infer_params = torch.cat(infer_params, dim=1)
 
     else:
+        print(f"************ Enter branch 4 with name: {name}", flush=True)
         # concat tensor
         infer_params = torch.cat(infer_params, dim=tp_utils.get_tensor_parallel_partition_dim(train_params))
 
@@ -946,6 +1067,7 @@ def per_tensor_generator(
                 weight_converter.hf_config,
                 convert_qkv_gate_up_by_simple_split,
             )
+            # print(f"[debug] tp all gather for name: [{cur_name}] with infer params len: [{len(infer_params)}]")
         else:
             infer_params = broad_pp_tensor
 

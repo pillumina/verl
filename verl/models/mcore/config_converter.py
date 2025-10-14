@@ -380,6 +380,60 @@ def hf_to_mcore_config_qwen2_5_vl(
     args = mapping_string_to_attn_backend(args)
     return TransformerConfig(**args)
 
+def hf_to_mcore_config_bailing_moe_v2(
+    hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
+) -> TransformerConfig:
+    """
+    Convert HuggingFace BailingMoeV2Config to Megatron-Core TransformerConfig.
+    Dense-front + MoE-back hybrid architecture.
+    """
+    shared_intermediate_size = getattr(hf_config, "moe_shared_expert_intermediate_size", None)
+    if shared_intermediate_size is None:
+        shared_intermediate_size = hf_config.moe_intermediate_size
+    args: dict = _get_base_transformer_config(
+        hf_config=hf_config,
+        dtype=dtype,
+        use_cpu_initialization=False,
+        add_bias_linear=False,
+        layernorm_epsilon=hf_config.rms_norm_eps,
+        # attention / rope
+        add_qkv_bias=hf_config.use_qkv_bias, # bailing only?
+        qk_layernorm=hf_config.use_qk_norm, 
+        kv_channels=hf_config.head_dim,
+        rotary_base=hf_config.rope_theta,
+        rotary_scaling=hf_config.rope_scaling,
+        # Ling-1T compatible
+        partial_rotary_factor=getattr(hf_config, "partial_rotary_factor", 1.0),
+        # dropout
+        attention_dropout=hf_config.attention_dropout,
+        hidden_dropout=getattr(hf_config, "embedding_dropout", 0.0),
+        max_position_embeddings=hf_config.max_position_embeddings,
+        # MoE
+        num_moe_experts=hf_config.num_experts,
+        moe_ffn_hidden_size=hf_config.moe_intermediate_size,
+        moe_router_topk=hf_config.num_experts_per_tok,
+        moe_router_bias_update_rate=0.001,
+        moe_router_enable_expert_bias=hf_config.moe_router_enable_expert_bias,
+        moe_shared_expert_intermediate_size=shared_intermediate_size * hf_config.num_shared_experts, # consistent with deepseekv3?
+        moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
+        moe_shared_expert_overlap=True,
+        moe_grouped_gemm=False,  # HF 侧独立 expert
+        moe_router_score_function=hf_config.score_function,
+        moe_router_load_balancing_type="none",
+        # moe_aux_loss_coeff=getattr(hf_config, "router_aux_loss_coef", 0.001),
+        # Bailing specific
+        first_k_dense_replace=hf_config.first_k_dense_replace,
+    )
+
+    # Generate moe_layer_freq pattern for hybrid dense-MoE architecture
+    moe_layer_freq = [1] * hf_config.num_hidden_layers  # Default all MoE
+    for i in range(min(hf_config.first_k_dense_replace, hf_config.num_hidden_layers)):
+        moe_layer_freq[i] = 0  # Set first k layers to dense
+    args['moe_layer_freq'] = moe_layer_freq
+
+    args.update(override_transformer_config_kwargs)
+    return check_and_construct_configs(args, TransformerConfig)
+
 
 def hf_to_mcore_config_llama4(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
