@@ -477,3 +477,52 @@ class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params
+
+
+class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterDense):
+    def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # decoder.layers.0.mlp.linear_fc1.weight              -> dense  gate+up
+        # decoder.layers.0.mlp.linear_fc2.weight              -> dense  down
+        # decoder.layers.1.pre_mlp_layernorm.weight           -> MoE  pre-norm
+        # decoder.layers.1.mlp.router.weight                  -> MoE  gate.weight
+        # decoder.layers.1.mlp.router.expert_bias             -> MoE  gate.expert_bias
+        # decoder.layers.1.mlp.shared_experts.linear_fc1.weight -> shared  gate+up
+        # decoder.layers.1.mlp.shared_experts.linear_fc2.weight -> shared  down
+        # decoder.layers.1.mlp.experts.linear_fc1.weight0     -> expert0  gate+up
+        # decoder.layers.1.mlp.experts.linear_fc2.weight0     -> expert0  down
+        # (expert_id 0-255, independent storage, no grouped-gemm)
+
+        layer_number = name.split(".")[2]
+
+        # 1. 公共 Pre-Norm
+        if "pre_mlp_layernorm" in name:
+            return [f"model.layers.{layer_number}.post_attention_layernorm.weight"], params
+
+        # 2. Router
+        if "mlp.router.weight" in name:
+            return [f"model.layers.{layer_number}.mlp.gate.weight"], params
+        if "mlp.router.expert_bias" in name:               # fp32 bias
+            return [f"model.layers.{layer_number}.mlp.gate.expert_bias"], params
+
+        # 3. Shared Experts (gate+up / down)
+        if "shared_experts.linear_fc1.weight" in name:   # [gate, up] concatenated
+            return [
+                f"model.layers.{layer_number}.mlp.shared_experts.gate_proj.weight",
+                f"model.layers.{layer_number}.mlp.shared_experts.up_proj.weight"
+            ], params
+        if "shared_experts.linear_fc2.weight" in name:   # down
+            return [f"model.layers.{layer_number}.mlp.shared_experts.down_proj.weight"], params
+
+        # 4. Routed Experts (independent storage, expert_id=0-255)
+        if "mlp.experts.linear_fc1" in name:            # gate+up per expert
+            expert_id = name.split("weight")[-1]        # weight0 ... weight255
+            return [
+                f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
+                f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight"
+            ], params
+        if "mlp.experts.linear_fc2" in name:            # down per expert
+            expert_id = name.split("weight")[-1]
+            return [f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"], params
+
+        # 5. Dense branch (early layers) -> reuse parent split logic
+        return super()._convert_mlp_param(name, params)
