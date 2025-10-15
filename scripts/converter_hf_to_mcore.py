@@ -418,6 +418,8 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     numel = 0
 
+    ref_state_dict = model.sharded_state_dict()
+
     # 1. Embedding
     if pp_rank == 0:
         numel += safe_copy(hf_model.model.word_embeddings.weight,
@@ -428,6 +430,13 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True),
     ):
         global_layer_idx = layer_idx + layer_start
+        
+        # ===== 打印当前层所有 key =====
+        current_keys = [k for k in ref_state_dict.keys() if f"decoder.layers.{global_layer_idx}." in k]
+        print(f"[PP{pp_rank}] layer={global_layer_idx}  keys={len(current_keys)}")
+        for k in current_keys:
+            print(f"  {k}")
+        # ===== 打印结束 =====
 
         # 2-1 Attention (common)
         numel += safe_copy(hf_layer.input_layernorm.weight, layer.self_attention.linear_qkv.layer_norm_weight)
@@ -435,26 +444,37 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         numel += safe_copy(qkv, layer.self_attention.linear_qkv.weight)
         numel += safe_copy(hf_layer.attention.dense.weight, 
                            layer.self_attention.linear_proj.weight)
-        numel += safe_copy(hf_layer.post_attention_layernorm.weight,
-                           layer.pre_mlp_layernorm.weight)
-
         # 2-2 FFN
         if global_layer_idx < getattr(hf_config, "first_k_dense_replace", 1):
-            # Dense branch
+            # Dense branch - copy post_attention_layernorm to linear_fc1.layer_norm_weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.mlp.linear_fc1.layer_norm_weight)
             fc1 = torch.cat([hf_layer.mlp.gate_proj.weight,
                              hf_layer.mlp.up_proj.weight], dim=0)
             numel += safe_copy(fc1, layer.mlp.linear_fc1.weight)
             numel += safe_copy(hf_layer.mlp.down_proj.weight,
                                layer.mlp.linear_fc2.weight)
         else:
-            # MoE branch
-            for i in range(hf_config.num_experts):
-                fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight,
-                                 hf_layer.mlp.experts[i].up_proj.weight], dim=0)
-                numel += safe_copy(fc1,
-                                   layer.mlp.experts.local_experts[i].linear_fc1.weight)
-                numel += safe_copy(hf_layer.mlp.experts[i].down_proj.weight,
-                                   layer.mlp.experts.local_experts[i].linear_fc2.weight)
+            # MoE branch - copy post_attention_layernorm to pre_mlp_layernorm.weight
+            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.pre_mlp_layernorm.weight)
+
+            # Handle experts based on moe_grouped_gemm setting
+            if hasattr(layer.mlp, 'experts') and hasattr(layer.mlp.experts, 'linear_fc1'):
+                # moe_grouped_gemm = True (grouped structure)
+                for i, hf_expert in enumerate(hf_layer.mlp.experts):
+                    fc1_weight = torch.cat([hf_expert.gate_proj.weight, hf_expert.up_proj.weight])
+                    linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    numel += safe_copy(fc1_weight, linear_fc1_weighti)
+                    linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    numel += safe_copy(hf_expert.down_proj.weight, linear_fc2_weighti)
+            else:
+                # moe_grouped_gemm = False (local_experts structure)
+                for i in range(hf_config.num_experts):
+                    fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight,
+                                     hf_layer.mlp.experts[i].up_proj.weight], dim=0)
+                    numel += safe_copy(fc1,
+                                       layer.mlp.experts.local_experts[i].linear_fc1.weight)
+                    numel += safe_copy(hf_layer.mlp.experts[i].down_proj.weight,
+                                       layer.mlp.experts.local_experts[i].linear_fc2.weight)
 
             shared_fc1 = torch.cat([hf_layer.mlp.shared_experts.gate_proj.weight,
                                     hf_layer.mlp.shared_experts.up_proj.weight], dim=0)

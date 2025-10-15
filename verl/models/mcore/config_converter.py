@@ -420,6 +420,13 @@ def hf_to_mcore_config_bailing_moe_v2(
         # Bailing specific
         first_k_dense_replace=hf_config.first_k_dense_replace,
     )
+
+    # Generate moe_layer_freq pattern for hybrid dense-MoE architecture
+    moe_layer_freq = [1] * hf_config.num_hidden_layers  # Default all MoE
+    for i in range(min(hf_config.first_k_dense_replace, hf_config.num_hidden_layers)):
+        moe_layer_freq[i] = 0  # Set first k layers to dense
+    args['moe_layer_freq'] = moe_layer_freq
+
     args.update(override_transformer_config_kwargs)
     return check_and_construct_configs(args, TransformerConfig)
 

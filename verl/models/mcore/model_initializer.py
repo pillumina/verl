@@ -286,8 +286,8 @@ class BailingMoeV2Model(BaseModelInitializer):
             self.tfconfig, use_transformer_engine=True, **extra_kwargs
         )
         # Bailing 共享 expert 也需要 gate
-        for spec in transformer_layer_spec.layer_specs:
-            spec.submodules.mlp.submodules.shared_experts.params["gate"] = True
+        # for spec in transformer_layer_spec.layer_specs:
+        #     spec.submodules.mlp.submodules.shared_experts.params["gate"] = True
         return transformer_layer_spec
 
     def initialize(self, **kwargs):
@@ -297,5 +297,6 @@ class BailingMoeV2Model(BaseModelInitializer):
             # align with deepv3?
             self.tfconfig.moe_router_load_balancing_type = "none"
             for layer in model.decoder.layers:
-                layer.mlp.router.weight.requires_grad = False
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router.weight.requires_grad = False
         return model
