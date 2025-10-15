@@ -514,13 +514,28 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterDense):
             return [f"model.layers.{layer_number}.mlp.shared_experts.down_proj.weight"], params
 
         # 4. Routed Experts (independent storage, expert_id=0-255)
-        if "mlp.experts.linear_fc1" in name:            # gate+up per expert
+        # Handle both formats:
+        # - mlp.experts.linear_fc1.weight0 (grouped format)
+        # - mlp.experts.local_experts.0.linear_fc1.weight (local_experts format)
+        if "mlp.experts.local_experts" in name:
+            # Format: decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight
+            expert_id = name.split("local_experts.")[1].split(".")[0]
+            if "linear_fc1.weight" in name:
+                return [
+                    f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
+                    f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight"
+                ], params
+            elif "linear_fc2.weight" in name:
+                return [f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"], params
+        elif "mlp.experts.linear_fc1" in name:
+            # Format: decoder.layers.1.mlp.experts.linear_fc1.weight0 (grouped format)
             expert_id = name.split("weight")[-1]        # weight0 ... weight255
             return [
                 f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
                 f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight"
             ], params
-        if "mlp.experts.linear_fc2" in name:            # down per expert
+        elif "mlp.experts.linear_fc2" in name:
+            # Format: decoder.layers.1.mlp.experts.linear_fc2.weight0 (grouped format)
             expert_id = name.split("weight")[-1]
             return [f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"], params
 
