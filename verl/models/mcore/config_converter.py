@@ -387,6 +387,9 @@ def hf_to_mcore_config_bailing_moe_v2(
     Convert HuggingFace BailingMoeV2Config to Megatron-Core TransformerConfig.
     Dense-front + MoE-back hybrid architecture.
     """
+    shared_intermediate_size = getattr(hf_config, "moe_shared_expert_intermediate_size", None)
+    if shared_intermediate_size is None:
+        shared_intermediate_size = hf_config.moe_intermediate_size
     args: dict = _get_base_transformer_config(
         hf_config=hf_config,
         dtype=dtype,
@@ -399,7 +402,8 @@ def hf_to_mcore_config_bailing_moe_v2(
         kv_channels=hf_config.head_dim,
         rotary_base=hf_config.rope_theta,
         rotary_scaling=hf_config.rope_scaling,
-        partial_rotary_factor=hf_config.partial_rotary_factor,
+        # Ling-1T compatible
+        partial_rotary_factor=getattr(hf_config, "partial_rotary_factor", 1.0),
         # dropout
         attention_dropout=hf_config.attention_dropout,
         hidden_dropout=getattr(hf_config, "embedding_dropout", 0.0),
@@ -410,7 +414,7 @@ def hf_to_mcore_config_bailing_moe_v2(
         moe_router_topk=hf_config.num_experts_per_tok,
         moe_router_bias_update_rate=0.001,
         moe_router_enable_expert_bias=hf_config.moe_router_enable_expert_bias,
-        moe_shared_expert_intermediate_size=hf_config.moe_shared_expert_intermediate_size * hf_config.num_shared_experts, # consistent with deepseekv3?
+        moe_shared_expert_intermediate_size=shared_intermediate_size * hf_config.num_shared_experts, # consistent with deepseekv3?
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
         moe_shared_expert_overlap=True,
         moe_grouped_gemm=False,  # HF 侧独立 expert
