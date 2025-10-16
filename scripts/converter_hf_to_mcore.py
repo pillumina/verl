@@ -430,7 +430,7 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True),
     ):
         global_layer_idx = layer_idx + layer_start
-        
+
         # ===== 打印当前层所有 key =====
         current_keys = [k for k in ref_state_dict.keys() if f"decoder.layers.{global_layer_idx}." in k]
         print(f"[PP{pp_rank}] layer={global_layer_idx}  keys={len(current_keys)}")
@@ -444,6 +444,11 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         numel += safe_copy(qkv, layer.self_attention.linear_qkv.weight)
         numel += safe_copy(hf_layer.attention.dense.weight, 
                            layer.self_attention.linear_proj.weight)
+
+        if hasattr(hf_layer.attention, "key_layernorm"):
+            numel += safe_copy(hf_layer.attention.key_layernorm.weight, layer.self_attention.k_layernorm.weight)
+            numel += safe_copy(hf_layer.attention.query_layernorm.weight, layer.self_attention.q_layernorm.weight)
+
         # 2-2 FFN
         if global_layer_idx < getattr(hf_config, "first_k_dense_replace", 1):
             # Dense branch - copy post_attention_layernorm to linear_fc1.layer_norm_weight

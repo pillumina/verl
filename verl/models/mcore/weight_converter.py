@@ -479,65 +479,131 @@ class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
         return convert_names, params
 
 
-class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterDense):
-    def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
-        # decoder.layers.0.mlp.linear_fc1.weight              -> dense  gate+up
-        # decoder.layers.0.mlp.linear_fc2.weight              -> dense  down
-        # decoder.layers.1.pre_mlp_layernorm.weight           -> MoE  pre-norm
-        # decoder.layers.1.mlp.router.weight                  -> MoE  gate.weight
-        # decoder.layers.1.mlp.router.expert_bias             -> MoE  gate.expert_bias
-        # decoder.layers.1.mlp.shared_experts.linear_fc1.weight -> shared  gate+up
-        # decoder.layers.1.mlp.shared_experts.linear_fc2.weight -> shared  down
-        # decoder.layers.1.mlp.experts.linear_fc1.weight0     -> expert0  gate+up
-        # decoder.layers.1.mlp.experts.linear_fc2.weight0     -> expert0  down
-        # (expert_id 0-255, independent storage, no grouped-gemm)
+class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
+    def _convert_attention_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # mcore
+        # 'decoder.layers.0.self_attention.linear_qkv.layer_norm_weight'
+        # 'decoder.layers.0.self_attention.linear_proj.weight'
+        # 'decoder.layers.0.self_attention.linear_qkv.weight'
+        # 'decoder.layers.0.self_attention.q_layernorm.weight'
+        # 'decoder.layers.0.self_attention.k_layernorm.weight' 
+        # hf
+        # 'model.layers.0.input_layernorm.weight'
+        # 'model.layers.0.attention.dense.weight'
+        # 'model.layers.0.attention.key_layernorm.weight'
+        # 'model.layers.0.attention.query_key_value.weight'
+        # 'model.layers.0.attention.query_layernorm.weight'
 
+        name_map_after_layer = {
+            "self_attention.linear_qkv.layer_norm_weight": "input_layernorm.weight",
+            "self_attention.linear_proj.weight": "attention.dense.weight",
+            "self_attention.q_layernorm.weight": "attention.query_layernorm.weight",
+            "self_attention.linear_qkv.weight": "attention.query_key_value.weight",
+            "self_attention.k_layernorm.weight": "attention.key_layernorm.weight",
+        }
+        print(f"convert attention params len: ${len(params)}")
+        assert len(params) == 1
+        convert_names = []
         layer_number = name.split(".")[2]
+        name_after_layer = name.split(f".{layer_number}.")[1]
+        convert_names.append(f"model.layers.{layer_number}.{name_map_after_layer[name_after_layer]}")
+        return convert_names, params
 
-        # 1. 公共 Pre-Norm
-        if "pre_mlp_layernorm" in name:
-            return [f"model.layers.{layer_number}.post_attention_layernorm.weight"], params
+    def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # mcore dense
+        # 'decoder.layers.0.mlp.linear_fc1.layer_norm_weight'
+        # 'decoder.layers.0.mlp.linear_fc2.weight'
+        # 'decoder.layers.0.mlp.linear_fc1.weight'
+        #       ---
+        # 'decoder.layers.1.mlp.shared_experts.linear_fc1.weight'
+        #       ---
+        # 'decoder.layers.1.mlp.shared_experts.linear_fc2.weight'
+        # hf dense
+        # 'model.layers.0.post_attention_layernorm.weight'
+        # 'model.layers.0.mlp.down_proj.weight'
+        # 'model.layers.0.mlp.gate_proj.weight'
+        # 'model.layers.0.mlp.up_proj.weight'
+        # 'model.layers.1.mlp.shared_experts.gate_proj.weight'
+        # 'model.layers.1.mlp.shared_experts.up_proj.weight'
+        # 'model.layers.1.mlp.shared_experts.down_proj.weight'
 
-        # 2. Router
-        if "mlp.router.weight" in name:
-            return [f"model.layers.{layer_number}.mlp.gate.weight"], params
-        if "mlp.router.expert_bias" in name:               # fp32 bias
-            return [f"model.layers.{layer_number}.mlp.gate.expert_bias"], params
+        # mcore moe
+        # 'decoder.layers.1.pre_mlp_layernorm.weight'
+        # 'decoder.layers.1.mlp.router.weight'
+        # 'decoder.layers.1.mlp.router.expert_bias'
+        # 'decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight'
+        #       ---
+        # 'decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight'
+        # hf moe
+        # 'model.layers.1.post_attention_layernorm.weight'
+        # 'model.layers.1.mlp.gate.weight'
+        # 'model.layers.1.mlp.gate.expert_bias'
+        # 'model.layers.1.mlp.experts.0.gate_proj.weight'
+        # 'model.layers.1.mlp.experts.0.up_proj.weight'
+        # 'model.layers.1.mlp.experts.0.down_proj.weight'
 
-        # 3. Shared Experts (gate+up / down)
-        if "shared_experts.linear_fc1.weight" in name:   # [gate, up] concatenated
-            return [
-                f"model.layers.{layer_number}.mlp.shared_experts.gate_proj.weight",
-                f"model.layers.{layer_number}.mlp.shared_experts.up_proj.weight"
-            ], params
-        if "shared_experts.linear_fc2.weight" in name:   # down
-            return [f"model.layers.{layer_number}.mlp.shared_experts.down_proj.weight"], params
+        name_map_after_layer = {
+            "mlp.linear_fc1.layer_norm_weight": "post_attention_layernorm.weight",
+            "mlp.linear_fc2.weight": "mlp.down_proj.weight",
+            "mlp.shared_experts.linear_fc2.weight": "mlp.shared_experts.down_proj.weight",
+            "mlp.linear_fc1.weight": ["mlp.gate_proj.weight", "mlp.up_proj.weight"],
+            "mlp.shared_experts.linear_fc1.weight": [
+                "mlp.shared_experts.gate_proj.weight",
+                "mlp.shared_experts.up_proj.weight",
+            ],
+            "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
+            "mlp.router.weight": "mlp.gate.weight",
+            "mlp.router.expert_bias": "mlp.gate.expert_bias",
+        }
+        convert_names = []
+        layer_number = name.split(".")[2]
+        name_after_layer = name.split(f".{layer_number}.")[1]
+        if name_after_layer in name_map_after_layer:
+            mapped_name = name_map_after_layer[name_after_layer]
+            if isinstance(mapped_name, list):
+                assert len(params) == len(mapped_name)
+                for one in mapped_name:
+                    convert_names.append(f"model.layers.{layer_number}.{one}")
+            else:
+                assert len(params) == 1
+                convert_names.append(f"model.layers.{layer_number}.{mapped_name}")
+        else:
+            if "mlp.experts.local_experts" in name:
+                expert_id = name.split("local_experts.")[1].split(".")[0]
+                if "linear_fc1.weight" in name:
+                    convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
+                    convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
+                    assert len(params) == 2
+                elif "linear_fc2.weight" in name:
+                    convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
+                    assert len(params) == 1
+            # if "mlp.experts.linear_fc1.weight" in name:
+            #     expert_id = name.split("weight")[-1]
+            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
+            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
+            #     assert len(params) == 2
+            # elif "mlp.experts.linear_fc2.weight" in name:
+            #     expert_id = name.split("weight")[-1]
+            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
+            #     assert len(params) == 1
+            else:
+                raise NotImplementedError(f"Unsupported parameter name: {name}")
 
-        # 4. Routed Experts (independent storage, expert_id=0-255)
-        # Handle both formats:
-        # - mlp.experts.linear_fc1.weight0 (grouped format)
-        # - mlp.experts.local_experts.0.linear_fc1.weight (local_experts format)
-        if "mlp.experts.local_experts" in name:
-            # Format: decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight
-            expert_id = name.split("local_experts.")[1].split(".")[0]
-            if "linear_fc1.weight" in name:
-                return [
-                    f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
-                    f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight"
-                ], params
-            elif "linear_fc2.weight" in name:
-                return [f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"], params
-        elif "mlp.experts.linear_fc1" in name:
-            # Format: decoder.layers.1.mlp.experts.linear_fc1.weight0 (grouped format)
-            expert_id = name.split("weight")[-1]        # weight0 ... weight255
-            return [
-                f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
-                f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight"
-            ], params
-        elif "mlp.experts.linear_fc2" in name:
-            # Format: decoder.layers.1.mlp.experts.linear_fc2.weight0 (grouped format)
-            expert_id = name.split("weight")[-1]
-            return [f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"], params
+        return convert_names, params
 
-        # 5. Dense branch (early layers) -> reuse parent split logic
-        return super()._convert_mlp_param(name, params)
+    def convert_param(self, name: str, params_one_group: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        direct_name_mapping = {
+            "embedding.word_embeddings.weight": "model.word_embeddings.weight",
+            "decoder.final_layernorm.weight": "model.norm.weight",
+            "output_layer.weight": "lm_head.weight",
+        }
+        if name in direct_name_mapping:
+            return [direct_name_mapping[name]], [params_one_group[0]]
+        # if "mtp" in name:
+        #     return self._convert_mtp_param(name, params_one_group)
+        elif "self_attention" in name or "linear_qkv.layer_norm_weight" in name:
+            return self._convert_attention_param(name, params_one_group)
+        elif "mlp" in name:
+            return self._convert_mlp_param(name, params_one_group)
+        else:
+            raise NotImplementedError(f"Unsupported parameter name: {name}")
