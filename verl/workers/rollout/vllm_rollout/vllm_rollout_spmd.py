@@ -220,7 +220,7 @@ class vLLMRollout(BaseRollout):
             repetition_penalty=config.get("repetition_penalty", 1.0),
         )
 
-        kwargs["detokenize"] = False
+        kwargs["detokenize"] = True
 
         # supporting adding any sampling params from the config file
         for k in config.keys():

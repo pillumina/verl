@@ -946,6 +946,7 @@ def per_tensor_generator(
                 weight_converter.hf_config,
                 convert_qkv_gate_up_by_simple_split,
             )
+            # print(f"[debug] tp all gather for name: [{cur_name}] with infer params len: [{len(infer_params)}]")
         else:
             infer_params = broad_pp_tensor
 

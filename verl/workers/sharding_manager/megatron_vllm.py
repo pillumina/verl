@@ -143,6 +143,7 @@ class MegatronVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
     def __enter__(self):
+        print("====== enter MegatronVLLMShardingManager ===========")
         self.timing = {}
         with simple_timer("reshard", self.timing):
             aggressive_empty_cache(force_sync=True)
@@ -168,6 +169,7 @@ class MegatronVLLMShardingManager(BaseShardingManager):
                     self.transformer_config,
                     self.layer_name_mapping,
                 )
+
             model = self.model_runner.model
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 

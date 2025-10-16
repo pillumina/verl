@@ -501,9 +501,6 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
             "self_attention.linear_qkv.weight": "attention.query_key_value.weight",
             "self_attention.k_layernorm.weight": "attention.key_layernorm.weight",
         }
-
-        print(f"convert attention params len: {len(params)}")
-        
         convert_names = []
         layer_number = name.split(".")[2]
         name_after_layer = name.split(f".{layer_number}.")[1]

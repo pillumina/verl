@@ -573,6 +573,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+            # Debug: Print the converted parameters for layer.0 and layer.1 only
+            print("=== Debug: per_tensor_generator output (layer.0 and layer.1) ===", flush=True)
+            param_count = 0
+            expert_count = 0
+            for name, param in per_tensor_param:
+                param_count += 1
+                # 只打印 layer.0 和 layer.1 的参数
+                if "model.layers.0." in name or "model.layers.1." in name:
+                    print(f"********** Layer Param {name}, shape: {param.shape}, dtype: {param.dtype}", flush=True)
+                    if "mlp.experts." in name:
+                        expert_count += 1
+            print(f"expert counts: {expert_count}", flush=True)
+            print(f"Total parameters generated: {param_count}", flush=True)
+            print("=== End Debug ===", flush=True)
 
         set_expandable_segments(False)
 
