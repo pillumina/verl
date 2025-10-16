@@ -486,7 +486,7 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
         # 'decoder.layers.0.self_attention.linear_proj.weight'
         # 'decoder.layers.0.self_attention.linear_qkv.weight'
         # 'decoder.layers.0.self_attention.q_layernorm.weight'
-        # 'decoder.layers.0.self_attention.k_layernorm.weight' 
+        # 'decoder.layers.0.self_attention.k_layernorm.weight'
         # hf
         # 'model.layers.0.input_layernorm.weight'
         # 'model.layers.0.attention.dense.weight'
@@ -501,11 +501,22 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
             "self_attention.linear_qkv.weight": "attention.query_key_value.weight",
             "self_attention.k_layernorm.weight": "attention.key_layernorm.weight",
         }
-        print(f"convert attention params len: ${len(params)}")
-        assert len(params) == 1
+
+        print(f"convert attention params len: {len(params)}")
+        
         convert_names = []
         layer_number = name.split(".")[2]
         name_after_layer = name.split(f".{layer_number}.")[1]
+
+        # Handle QKV parameters: might receive [q, k, v] or [concatenated_qkv]
+        if "self_attention.linear_qkv.weight" in name:
+            if len(params) == 3:
+                # Received separated q, k, v tensors - concatenate them
+                q, k, v = params
+                params = [torch.cat([q, k, v], dim=0)]
+            elif len(params) != 1:
+                raise ValueError(f"Expected 1 or 3 params for QKV, got {len(params)}")
+
         convert_names.append(f"model.layers.{layer_number}.{name_map_after_layer[name_after_layer]}")
         return convert_names, params
 
