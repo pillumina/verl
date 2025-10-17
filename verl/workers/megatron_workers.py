@@ -573,11 +573,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+            # Convert generator to list so it can be used multiple times
+            per_tensor_param_list = list(per_tensor_param)
             # Debug: Print the converted parameters for layer.0 and layer.1 only
             print("=== Debug: per_tensor_generator output (layer.0 and layer.1) ===", flush=True)
             param_count = 0
             expert_count = 0
-            for name, param in per_tensor_param:
+            for name, param in per_tensor_param_list:
                 param_count += 1
                 # 只打印 layer.0 和 layer.1 的参数
                 if "model.layers.0." in name or "model.layers.1." in name:
@@ -588,18 +590,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             print(f"Total parameters generated: {param_count}", flush=True)
             print("=== End Debug ===", flush=True)
 
-            # Save converted weights for comparison
-            print("=== Saving converted HF weights for comparison ===", flush=True)
-            converted_state_dict = {}
-            for name, param in per_tensor_param:
-                converted_state_dict[name] = param.detach().cpu()
+            # # Save converted weights for comparison
+            # print("=== Saving converted HF weights for comparison ===", flush=True)
+            # converted_state_dict = {}
+            # for name, param in per_tensor_param_list:
+            #     converted_state_dict[name] = param.detach().cpu()
 
-            # Save to file
-            import os
-            save_path = "/mnt/sfs_turbo/hyx/megatron_converted_weights.pt"
-            torch.save(converted_state_dict, save_path)
-            print(f"Converted weights saved to: {os.path.abspath(save_path)}", flush=True)
-            print(f"Total parameters saved: {len(converted_state_dict)}", flush=True)
+            # # Save to file
+            # import os
+            # save_path = "/mnt/sfs_turbo/hyx/megatron_converted_weights.pt"
+            # torch.save(converted_state_dict, save_path)
+            # print(f"Converted weights saved to: {os.path.abspath(save_path)}", flush=True)
+            # print(f"Total parameters saved: {len(converted_state_dict)}", flush=True)
 
         set_expandable_segments(False)
 
