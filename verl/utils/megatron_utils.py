@@ -749,8 +749,12 @@ def default_tp_concat_fn(
     """
     from megatron.core import mpu
 
+    print(f"************ Enter default_tp_concat_fn with name: {name}******************", flush=True)
+    convert_qkv_gate_up_by_simple_split = False
+
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
+        print(f"************ Enter branch 1 with name: {name}", flush=True)
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
         q_lst = []
@@ -790,6 +794,7 @@ def default_tp_concat_fn(
         and "layer_norm" not in name
         and "vision_model.projection" not in name
     ):
+        print(f"************ Enter branch 2 with name: {name}", flush=True)
         # if the tensor is gate and proj
         gate_lst = []
         up_lst = []
@@ -802,9 +807,11 @@ def default_tp_concat_fn(
         infer_params = torch.cat((gate, up), dim=0) if not convert_qkv_gate_up_by_simple_split else [gate, up]
 
     elif "mlp.experts.linear_fc2.weight" in name:  # moe
+        print(f"************ Enter branch 3 with name: {name}", flush=True)
         infer_params = torch.cat(infer_params, dim=1)
 
     else:
+        print(f"************ Enter branch 4 with name: {name}", flush=True)
         # concat tensor
         infer_params = torch.cat(infer_params, dim=tp_utils.get_tensor_parallel_partition_dim(train_params))
 
