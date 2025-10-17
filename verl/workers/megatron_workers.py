@@ -588,6 +588,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             print(f"Total parameters generated: {param_count}", flush=True)
             print("=== End Debug ===", flush=True)
 
+            # Save converted weights for comparison
+            print("=== Saving converted HF weights for comparison ===", flush=True)
+            converted_state_dict = {}
+            for name, param in per_tensor_param:
+                converted_state_dict[name] = param.detach().cpu()
+
+            # Save to file
+            import os
+            save_path = "/mnt/sfs_turbo/hyx/megatron_converted_weights.pt"
+            torch.save(converted_state_dict, save_path)
+            print(f"Converted weights saved to: {os.path.abspath(save_path)}", flush=True)
+            print(f"Total parameters saved: {len(converted_state_dict)}", flush=True)
+
         set_expandable_segments(False)
 
         if self.config.rollout.free_cache_engine:
