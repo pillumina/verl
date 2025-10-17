@@ -753,6 +753,45 @@ def default_tp_concat_fn(
 
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
+
+        # EXPERIMENTAL: Test uniform TP sharding handling
+        # This assumes each TP shard gets a uniform portion of the full QKV tensor
+        # instead of being pre-split by Q:K:V ratio
+        if True:  # Enable this experimental branch
+            print(f"************ Enter EXPERIMENTAL uniform sharding branch", flush=True)
+            print(f"DEBUG: Experimental branch - treating infer_params as uniform shards", flush=True)
+
+            # If infer_params has uniform shards, just concatenate them directly
+            if len(infer_params) > 1:
+                # Multiple shards - concatenate them to get full QKV
+                experimental_result = torch.cat(infer_params, dim=0)
+                print(f"DEBUG: Experimental concatenated shape: {experimental_result.shape}", flush=True)
+
+                # For convert_qkv_gate_up_by_simple_split=True, we need to return [q, k, v]
+                if convert_qkv_gate_up_by_simple_split:
+                    # Split the full QKV into Q, K, V using the correct ratio
+                    num_attention_heads = model_config.num_attention_heads
+                    num_key_value_heads = model_config.num_key_value_heads
+                    total_qkv_dim = experimental_result.shape[0]
+
+                    # Calculate expected dimensions
+                    head_dim = model_config.hidden_size // num_attention_heads
+                    q_dim = num_attention_heads * head_dim
+                    k_dim = num_key_value_heads * head_dim
+                    v_dim = num_key_value_heads * head_dim
+
+                    print(f"DEBUG: Expected QKV dims - Q:{q_dim}, K:{k_dim}, V:{v_dim}, Total:{q_dim+k_dim+v_dim}", flush=True)
+
+                    # Split the concatenated tensor
+                    q, k, v = experimental_result.split([q_dim, k_dim, v_dim], dim=0)
+                    experimental_result = [q, k, v]
+                    print(f"DEBUG: Experimental QKV shapes - Q:{q.shape}, K:{k.shape}, V:{v.shape}", flush=True)
+
+                print(f"DEBUG: Using experimental result instead of original logic", flush=True)
+                return experimental_result
+            else:
+                print(f"DEBUG: Single tensor in infer_params, returning as-is", flush=True)
+                return infer_params[0]
         print(f"************ Enter branch 1 with name: {name}", flush=True)
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
@@ -761,6 +800,16 @@ def default_tp_concat_fn(
         original_infer_param = infer_params[0].clone() if hasattr(infer_params[0], 'clone') else infer_params[0]
         print(f"DEBUG: Original infer_param shape: {original_infer_param.shape}", flush=True)
         print(f"DEBUG: train_tp_size: {train_tp_size}", flush=True)
+        print(f"DEBUG: infer_params length: {len(infer_params)}", flush=True)
+        print(f"DEBUG: infer_params shapes: {[p.shape for p in infer_params]}", flush=True)
+
+        # Check if infer_params contains TP shards or full tensors
+        total_elements = sum(p.shape[0] for p in infer_params)
+        print(f"DEBUG: Total elements in infer_params: {total_elements}", flush=True)
+        if total_elements == original_infer_param.shape[0] * len(infer_params):
+            print(f"DEBUG: infer_params contains TP shards (consistent with TP size)", flush=True)
+        else:
+            print(f"DEBUG: infer_params contains mixed/inconsistent data!", flush=True)
         q_lst = []
         k_lst = []
         v_lst = []
