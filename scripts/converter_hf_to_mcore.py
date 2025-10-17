@@ -436,6 +436,7 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True),
     ):
         global_layer_idx = layer_idx + layer_start
+        numel_cur: int = numel
 
         # ===== 打印当前层所有 key =====
         current_keys = [k for k in ref_state_dict.keys() if f"decoder.layers.{global_layer_idx}." in k]
@@ -510,7 +511,8 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
             numel += safe_copy(hf_layer.mlp.gate.expert_bias,
                                layer.mlp.router.expert_bias,
                                skip_dtype_assert=True)
-
+                               
+        assert numel - numel_cur == sum([i.numel() for i in hf_layer.state_dict().values()]), "numel mismatch"
         print(f"PP{pp_rank}  layer={global_layer_idx}  total={numel}")
 
     # 3. Final norm + LM head

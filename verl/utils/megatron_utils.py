@@ -750,7 +750,6 @@ def default_tp_concat_fn(
     from megatron.core import mpu
 
     print(f"************ Enter default_tp_concat_fn with name: {name}******************", flush=True)
-    convert_qkv_gate_up_by_simple_split = False
 
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
