@@ -573,22 +573,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
-            # Convert generator to list so it can be used multiple times
-            per_tensor_param_list = list(per_tensor_param)
-            # Debug: Print the converted parameters for layer.0 and layer.1 only
-            print("=== Debug: per_tensor_generator output (layer.0 and layer.1) ===", flush=True)
-            param_count = 0
-            expert_count = 0
-            for name, param in per_tensor_param_list:
-                param_count += 1
-                # 只打印 layer.0 和 layer.1 的参数
-                if "model.layers.0." in name or "model.layers.1." in name:
-                    print(f"********** Layer Param {name}, shape: {param.shape}, dtype: {param.dtype}", flush=True)
-                    if "mlp.experts." in name:
-                        expert_count += 1
-            print(f"expert counts: {expert_count}", flush=True)
-            print(f"Total parameters generated: {param_count}", flush=True)
-            print("=== End Debug ===", flush=True)
+            # # Convert generator to list so it can be used multiple times
+            # per_tensor_param_list = list(per_tensor_param)
+            # # Debug: Print the converted parameters for layer.0 and layer.1 only
+            # print("=== Debug: per_tensor_generator output (layer.0 and layer.1) ===", flush=True)
+            # param_count = 0
+            # expert_count = 0
+            # for name, param in per_tensor_param_list:
+            #     param_count += 1
+            #     # 只打印 layer.0 和 layer.1 的参数
+            #     if "model.layers.0." in name or "model.layers.1." in name:
+            #         print(f"********** Layer Param {name}, shape: {param.shape}, dtype: {param.dtype}", flush=True)
+            #         if "mlp.experts." in name:
+            #             expert_count += 1
+            # print(f"expert counts: {expert_count}", flush=True)
+            # print(f"Total parameters generated: {param_count}", flush=True)
+            # print("=== End Debug ===", flush=True)
 
             # # Save converted weights for comparison
             # print("=== Saving converted HF weights for comparison ===", flush=True)

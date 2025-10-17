@@ -767,6 +767,8 @@ def default_tp_concat_fn(
                 experimental_result = torch.cat(infer_params, dim=0)
                 print(f"DEBUG: Experimental concatenated shape: {experimental_result.shape}", flush=True)
 
+                convert_qkv_gate_up_by_simple_split = False
+
                 # For convert_qkv_gate_up_by_simple_split=True, we need to return [q, k, v]
                 if convert_qkv_gate_up_by_simple_split:
                     # Split the full QKV into Q, K, V using the correct ratio
@@ -786,6 +788,10 @@ def default_tp_concat_fn(
                     q, k, v = experimental_result.split([q_dim, k_dim, v_dim], dim=0)
                     experimental_result = [q, k, v]
                     print(f"DEBUG: Experimental QKV shapes - Q:{q.shape}, K:{k.shape}, V:{v.shape}", flush=True)
+                else:
+                    # For convert_qkv_gate_up_by_simple_split=False, return concatenated tensor directly
+                    print(f"DEBUG: convert_qkv_gate_up_by_simple_split=False, returning concatenated QKV tensor", flush=True)
+                    print(f"DEBUG: Final experimental result shape: {experimental_result.shape}", flush=True)
 
                 print(f"DEBUG: Using experimental result instead of original logic", flush=True)
                 return experimental_result
