@@ -31,6 +31,45 @@ def save_original_hf_weights(model_path, save_path="/mnt/sfs_turbo/hyx/original_
 
     return state_dict
 
+def inspect_qkv_tensors(original_path):
+    """Inspect and print statistics for source attention.query_key_value.weight tensors"""
+    print(f"\n=== Inspecting QKV Tensors ===")
+    print(f"Loading: {original_path}")
+
+    original = torch.load(original_path, map_location='cpu')
+
+    # Find all QKV tensors
+    qkv_keys = [k for k in original.keys() if 'attention.query_key_value.weight' in k]
+
+    print(f"Found {len(qkv_keys)} QKV tensors")
+
+    for i, key in enumerate(sorted(qkv_keys)):
+        tensor = original[key]
+        print(f"\n--- QKV Tensor {i+1}/{len(qkv_keys)} ---")
+        print(f"Name: {key}")
+        print(f"Shape: {tensor.shape}")
+        print(f"Data type: {tensor.dtype}")
+        print(f"Mean: {tensor.mean().item():.6f}")
+        print(f"Std: {tensor.std().item():.6f}")
+        print(f"Min: {tensor.min().item():.6f}")
+        print(f"Max: {tensor.max().item():.6f}")
+
+        # Check first few and last few values
+        flat_tensor = tensor.view(-1)
+        print(f"First 5 values: {flat_tensor[:5].tolist()}")
+        print(f"Last 5 values: {flat_tensor[-5:].tolist()}")
+
+        # Check for patterns that might indicate rank-based distribution
+        if tensor.shape[0] >= 4:  # At least 4 rows to analyze
+            row_means = tensor.mean(dim=1)  # Mean of each row
+            print(f"Row means - First 3: {row_means[:3].tolist()}")
+            print(f"Row means - Last 3: {row_means[-3:].tolist()}")
+
+            mid_point = tensor.shape[0] // 2
+            print(f"DEBUG:   Row means at mid point ({mid_point}): {row_means[mid_point-1:mid_point+2].tolist()}", flush=True)
+
+    print(f"\n=== QKV Inspection Complete ===\n")
+
 def compare_weights(original_path, converted_path, compare_all=False, diff_threshold=1e-6):
     """Compare original and converted weights"""
     print(f"\n=== Comparing weights ===")
@@ -47,40 +86,6 @@ def compare_weights(original_path, converted_path, compare_all=False, diff_thres
     # Find common keys
     common_keys = set(original.keys()) & set(converted.keys())
     print(f"Common keys: {len(common_keys)}")
-
-    # Always do the original key_patterns comparison
-    print("\n=== Comparing key parameters ===")
-    key_patterns = [
-        "model.layers.0.attention.dense.weight",
-        "model.layers.0.input_layernorm.weight",
-        "model.layers.0.attention.query_key_value.weight",
-        "model.layers.1.attention.query_key_value.weight",
-        # "model.layers.1.mlp.experts.0.gate_proj.weight",
-        # "model.layers.1.mlp.experts.0.up_proj.weight",
-        # "model.layers.1.mlp.experts.0.down_proj.weight",
-        "model.layers.1.input_layernorm.weight",
-        "lm_head.weight",
-    ]
-
-    for pattern in key_patterns:
-        if pattern in original and pattern in converted:
-            orig = original[pattern]
-            conv = converted[pattern]
-
-            print(f"\n{pattern}:")
-            print(f"  Shape match: {orig.shape == conv.shape}")
-            print(f"  Orig shape: {orig.shape}, Conv shape: {conv.shape}")
-
-            if orig.shape == conv.shape:
-                # Compute difference
-                diff = torch.abs(orig - conv)
-                print(f"  Max diff: {diff.max().item():.6f}")
-                print(f"  Mean diff: {diff.mean().item():.6f}")
-                print(f"  Orig mean: {orig.mean().item():.6f}, Conv mean: {conv.mean().item():.6f}")
-            else:
-                print(f"  SHAPE MISMATCH!")
-        else:
-            print(f"\n{pattern}: NOT FOUND in both")
 
     # Optional: Compare all layers and find mismatches
     if compare_all:
@@ -128,6 +133,40 @@ def compare_weights(original_path, converted_path, compare_all=False, diff_thres
 
             if len(diff_mismatches) > 10:
                 print(f"  ... and {len(diff_mismatches) - 10} more layers with diff mismatches")
+    else:
+        # Do the original key_patterns comparison
+        print("\n=== Comparing key parameters ===")
+        key_patterns = [
+            "model.layers.0.attention.dense.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.attention.query_key_value.weight",
+            "model.layers.1.attention.query_key_value.weight",
+            # "model.layers.1.mlp.experts.0.gate_proj.weight",
+            # "model.layers.1.mlp.experts.0.up_proj.weight",
+            # "model.layers.1.mlp.experts.0.down_proj.weight",
+            "model.layers.1.input_layernorm.weight",
+            "lm_head.weight",
+        ]
+
+        for pattern in key_patterns:
+            if pattern in original and pattern in converted:
+                orig = original[pattern]
+                conv = converted[pattern]
+
+                print(f"\n{pattern}:")
+                print(f"  Shape match: {orig.shape == conv.shape}")
+                print(f"  Orig shape: {orig.shape}, Conv shape: {conv.shape}")
+
+                if orig.shape == conv.shape:
+                    # Compute difference
+                    diff = torch.abs(orig - conv)
+                    print(f"  Max diff: {diff.max().item():.6f}")
+                    print(f"  Mean diff: {diff.mean().item():.6f}")
+                    print(f"  Orig mean: {orig.mean().item():.6f}, Conv mean: {conv.mean().item():.6f}")
+                else:
+                    print(f"  SHAPE MISMATCH!")
+            else:
+                print(f"\n{pattern}: NOT FOUND in both")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare original HF weights with converted Megatron weights")
@@ -136,10 +175,17 @@ if __name__ == "__main__":
                        help="Path to original HF weights file")
     parser.add_argument("--converted", type=str, default="/mnt/sfs_turbo/hyx/megatron_converted_weights.pt",
                        help="Path to converted Megatron weights file")
+    parser.add_argument("--do-compare", action="store_true",
+                       help="Do layers comparison and report mismatches")
     parser.add_argument("--compare-all", action="store_true",
                        help="Compare all layers and report mismatches")
     parser.add_argument("--diff-threshold", type=float, default=1e-6,
                        help="Threshold for considering a difference significant (default: 1e-6)")
+    parser.add_argument("--inspect-src-qkv", action="store_true",
+                       help="Inspect and print statistics for source attention.query_key_value.weight tensors")
+    parser.add_argument("--inspect-converted-qkv", action="store_true",
+                       help="Inspect and print statistics for converted attention.query_key_value.weight tensors")
+
 
     args = parser.parse_args()
 
@@ -147,5 +193,13 @@ if __name__ == "__main__":
     if args.save_original:
         save_original_hf_weights(args.save_original, args.original)
 
+    # Inspect source QKV tensors if requested
+    if args.inspect_src_qkv:
+        inspect_qkv_tensors(args.original)
+
+    if args.inspect_converted_qkv:
+        inspect_qkv_tensors(args.converted)
+
     # Compare weights
-    compare_weights(args.original, args.converted, args.compare_all, args.diff_threshold)
+    if args.do_compare:
+        compare_weights(args.original, args.converted, args.compare_all, args.diff_threshold)

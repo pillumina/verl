@@ -767,6 +767,30 @@ def default_tp_concat_fn(
                 experimental_result = torch.cat(infer_params, dim=0)
                 print(f"DEBUG: Experimental concatenated shape: {experimental_result.shape}", flush=True)
 
+                # Print statistics for concatenated weight tensor
+                print(f"DEBUG: Concatenated tensor statistics for layer: {name}", flush=True)
+                print(f"DEBUG:   Mean: {experimental_result.mean().item():.6f}", flush=True)
+                print(f"DEBUG:   Std:  {experimental_result.std().item():.6f}", flush=True)
+                print(f"DEBUG:   Min:  {experimental_result.min().item():.6f}", flush=True)
+                print(f"DEBUG:   Max:  {experimental_result.max().item():.6f}", flush=True)
+                print(f"DEBUG:   Data type: {experimental_result.dtype}", flush=True)
+
+                # Check first few and last few values (similar to inspect_src_qkv_tensors)
+                flat_tensor = experimental_result.view(-1)
+                total_elements = flat_tensor.shape[0]
+                print(f"DEBUG:   First 5 values: {flat_tensor[:5].tolist()}", flush=True)
+                print(f"DEBUG:   Last 5 values: {flat_tensor[-5:].tolist()}", flush=True)
+
+                # Check for patterns that might indicate rank-based distribution
+                if experimental_result.shape[0] >= 4:  # At least 4 rows to analyze
+                    row_means = experimental_result.mean(dim=1)  # Mean of each row
+                    print(f"DEBUG:   Row means - First 3: {row_means[:3].tolist()}", flush=True)
+                    print(f"DEBUG:   Row means - Last 3: {row_means[-3:].tolist()}", flush=True)
+
+                    # Also check middle section for potential rank boundaries
+                    mid_point = experimental_result.shape[0] // 2
+                    print(f"DEBUG:   Row means at mid point ({mid_point}): {row_means[mid_point-1:mid_point+2].tolist()}", flush=True)
+
                 convert_qkv_gate_up_by_simple_split = False
 
                 # For convert_qkv_gate_up_by_simple_split=True, we need to return [q, k, v]
