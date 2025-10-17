@@ -499,6 +499,7 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
             "self_attention.linear_proj.weight": "attention.dense.weight",
             "self_attention.q_layernorm.weight": "attention.query_layernorm.weight",
             "self_attention.linear_qkv.weight": "attention.query_key_value.weight",
+            "self_attention.linear_qkv.bias": "attention.query_key_value.bias",
             "self_attention.k_layernorm.weight": "attention.key_layernorm.weight",
         }
         convert_names = []
@@ -507,6 +508,13 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
 
         # Handle QKV parameters: might receive [q, k, v] or [concatenated_qkv]
         if "self_attention.linear_qkv.weight" in name:
+            if len(params) == 3:
+                # Received separated q, k, v tensors - concatenate them
+                q, k, v = params
+                params = [torch.cat([q, k, v], dim=0)]
+            elif len(params) != 1:
+                raise ValueError(f"Expected 1 or 3 params for QKV, got {len(params)}")
+        if "self_attention.linear_qkv.bias" in name:
             if len(params) == 3:
                 # Received separated q, k, v tensors - concatenate them
                 q, k, v = params

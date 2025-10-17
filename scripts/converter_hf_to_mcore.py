@@ -418,7 +418,13 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     numel = 0
 
-    ref_state_dict = model.sharded_state_dict()
+    ref_state_dict = model.sharded_state_dict() 
+
+    use_qkv_bias = getattr(hf_config, "use_qkv_bias", False)
+
+    use_bias = getattr(hf_config, "use_bias", False)
+
+    use_qk_norm = getattr(hf_config, "use_qk_norm", False)
 
     # 1. Embedding
     if pp_rank == 0:
@@ -442,10 +448,16 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
         numel += safe_copy(hf_layer.input_layernorm.weight, layer.self_attention.linear_qkv.layer_norm_weight)
         qkv = hf_layer.attention.query_key_value.weight
         numel += safe_copy(qkv, layer.self_attention.linear_qkv.weight)
-        numel += safe_copy(hf_layer.attention.dense.weight, 
-                           layer.self_attention.linear_proj.weight)
 
-        if hasattr(hf_layer.attention, "key_layernorm"):
+        if use_qkv_bias:
+            numel += safe_copy(hf_layer.query_key_value.bias, layer.self_attention.linear_qkv.bias)
+
+        numel += safe_copy(hf_layer.attention.dense.weight, layer.self_attention.linear_proj.weight)
+        
+        if use_bias:
+            numel += safe_copy(hf_layer.attention.dense.bias, layer.self_attention.linear_proj.bias)
+
+        if use_qk_norm:
             numel += safe_copy(hf_layer.attention.key_layernorm.weight, layer.self_attention.k_layernorm.weight)
             numel += safe_copy(hf_layer.attention.query_layernorm.weight, layer.self_attention.q_layernorm.weight)
 
@@ -474,11 +486,18 @@ def convert_checkpoint_from_transformers_to_megatron_bailing(
             else:
                 # moe_grouped_gemm = False (local_experts structure)
                 for i in range(hf_config.num_experts):
-                    fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight,
-                                     hf_layer.mlp.experts[i].up_proj.weight], dim=0)
+                    # todo: 改成聚集的形式
+                    fc1 = torch.cat([hf_layer.mlp.experts[i].gate_proj.weight, hf_layer.mlp.experts[i].up_proj.weight])
+                    # linear_fc1_weighti = getattr(layer.mlp.experts.linear_fc1, "weight" + str(i))
+                    # numel += safe_copy(fc1, linear_fc1_weighti)
+
+                    fc2 = hf_layer.mlp.experts[i].down_proj.weight 
+                    # linear_fc2_weighti = getattr(layer.mlp.experts.linear_fc2, "weight" + str(i))
+                    # numel += safe_copy(fc2, linear_fc2_weighti)
+
                     numel += safe_copy(fc1,
                                        layer.mlp.experts.local_experts[i].linear_fc1.weight)
-                    numel += safe_copy(hf_layer.mlp.experts[i].down_proj.weight,
+                    numel += safe_copy(fc2,
                                        layer.mlp.experts.local_experts[i].linear_fc2.weight)
 
             shared_fc1 = torch.cat([hf_layer.mlp.shared_experts.gate_proj.weight,
