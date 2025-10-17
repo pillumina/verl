@@ -756,6 +756,11 @@ def default_tp_concat_fn(
         print(f"************ Enter branch 1 with name: {name}", flush=True)
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
+
+        # Debug: Save original infer_params for comparison
+        original_infer_param = infer_params[0].clone() if hasattr(infer_params[0], 'clone') else infer_params[0]
+        print(f"DEBUG: Original infer_param shape: {original_infer_param.shape}", flush=True)
+        print(f"DEBUG: train_tp_size: {train_tp_size}", flush=True)
         q_lst = []
         k_lst = []
         v_lst = []
@@ -787,6 +792,37 @@ def default_tp_concat_fn(
         k = torch.cat(k_lst, dim=0)
         v = torch.cat(v_lst, dim=0)
         infer_params = torch.cat((q, k, v), dim=0) if not convert_qkv_gate_up_by_simple_split else [q, k, v]
+
+        # Debug: Compare original vs processed
+        print(f"DEBUG: convert_qkv_gate_up_by_simple_split: {convert_qkv_gate_up_by_simple_split}", flush=True)
+        print(f"DEBUG: num_q_per_kv: {num_q_per_kv}", flush=True)
+        print(f"DEBUG: kv_size_per_tp: {kv_size_per_tp}", flush=True)
+        print(f"DEBUG: split_size: {[kv_size_per_tp * num_q_per_kv, kv_size_per_tp, kv_size_per_tp]}", flush=True)
+        print(f"DEBUG: num_query_groups_per_partition: {num_query_groups_per_partition}", flush=True)
+
+        if convert_qkv_gate_up_by_simple_split:
+            # When True, infer_params is [q, k, v] list
+            print(f"DEBUG: Processed infer_params type: list, shapes: {[p.shape for p in infer_params]}", flush=True)
+            # For comparison, re-concatenate the split tensors
+            reconcatenated = torch.cat(infer_params, dim=0)
+            print(f"DEBUG: Re-concatenated shape: {reconcatenated.shape}", flush=True)
+
+            # Check if split introduces precision issues
+            are_equal = torch.allclose(original_infer_param, reconcatenated, atol=1e-6)
+            max_diff = torch.max(torch.abs(original_infer_param - reconcatenated)).item()
+            print(f"DEBUG: Original vs Re-concatenated are equal: {are_equal}", flush=True)
+            print(f"DEBUG: Max difference: {max_diff}", flush=True)
+            if not are_equal:
+                print(f"DEBUG: WARNING - Split operation introduced precision differences!", flush=True)
+        else:
+            # When False, infer_params is concatenated tensor
+            print(f"DEBUG: Processed infer_params shape: {infer_params.shape}", flush=True)
+            are_equal = torch.allclose(original_infer_param, infer_params, atol=1e-6)
+            max_diff = torch.max(torch.abs(original_infer_param - infer_params)).item()
+            print(f"DEBUG: Original vs Processed are equal: {are_equal}", flush=True)
+            print(f"DEBUG: Max difference: {max_diff}", flush=True)
+            if not are_equal:
+                print(f"DEBUG: WARNING - Split-cat operation introduced precision differences!", flush=True)
 
     elif (
         layer_name_mapping.get("gate_proj_layer_name") in name
