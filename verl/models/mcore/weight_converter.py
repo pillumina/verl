@@ -593,15 +593,15 @@ class McoreToHFWeightConverterBailingMoeV2(McoreToHFWeightConverterBase):
                 elif "linear_fc2.weight" in name:
                     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
                     assert len(params) == 1
-            # if "mlp.experts.linear_fc1.weight" in name:
-            #     expert_id = name.split("weight")[-1]
-            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
-            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
-            #     assert len(params) == 2
-            # elif "mlp.experts.linear_fc2.weight" in name:
-            #     expert_id = name.split("weight")[-1]
-            #     convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
-            #     assert len(params) == 1
+            if "mlp.experts.linear_fc1.weight" in name:
+                expert_id = name.split("weight")[-1]
+                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
+                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
+                assert len(params) == 2
+            elif "mlp.experts.linear_fc2.weight" in name:
+                expert_id = name.split("weight")[-1]
+                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
+                assert len(params) == 1
             else:
                 raise NotImplementedError(f"Unsupported parameter name: {name}")
 

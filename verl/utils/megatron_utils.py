@@ -934,41 +934,81 @@ def per_tensor_generator(
         while cur_name.startswith("module."):
             cur_name = cur_name[len("module.") :]
 
-        # EP
-        if ".mlp.experts.linear_fc" in cur_name and ep_size > 1:
+        # EP - Support both traditional MoE and BailingMoeV2 local_experts
+        def is_expert_layer(cur_name, ep_size):
+            """检测是否为专家层权重，支持传统MoE和BailingMoeV2格式"""
+            expert_patterns = [
+                ".mlp.experts.linear_fc",      # 传统MoE格式：experts.linear_fc1.weight0
+                ".mlp.experts.local_experts",  # BailingMoeV2格式：experts.local_experts.0.linear_fc1
+            ]
+            return any(pattern in cur_name for pattern in expert_patterns) and ep_size > 1
+
+        if is_expert_layer(cur_name, ep_size):
             num_experts = weight_converter.mcore_config.num_moe_experts
             num_experts_per_rank = num_experts // ep_size
             infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
             torch.distributed.all_gather(infer_params, broad_pp_tensor, group=ep_group)
+            # 处理不同格式的专家层命名
+            if ".mlp.experts.local_experts" in cur_name:
+                # BailingMoeV2格式：decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight
+                # 直接使用原始的cur_name，BailingMoeV2的weight converter可以处理local_experts格式
+                left, right = cur_name.rsplit('local_experts.', 1) 
+                local_expert_id_str, suffix = right.split('.', 1)
+                local_expert_id = int(local_expert_id_str)
+                global_expert_ids = [num_experts_per_rank * ep_rank + local_expert_id for ep_rank in range(ep_size)]
+                global_expert_names = [f"{left}local_experts.{expert_id}.{suffix}" for expert_id in global_expert_ids]
 
-            name_prefix, local_expert_id = cur_name.split(".weight")
-            local_expert_id = int(local_expert_id)
-            global_expert_ids = [num_experts_per_rank * ep_rank + local_expert_id for ep_rank in range(ep_size)]
-            global_expert_names = [f"{name_prefix}.weight{expert_id}" for expert_id in global_expert_ids]
-
-            for name, param in zip(global_expert_names, infer_params, strict=True):
                 if etp_size > 1:
-                    # gather etp
-                    etp_params = [torch.empty_like(param) for _ in range(etp_size)]
-                    torch.distributed.all_gather(etp_params, param, group=etp_group)
-                    params = etp_params
+                    etp_params = [torch.empty_like(broad_pp_tensor) for _ in range(etp_size)]
+                    torch.distributed.all_gather(etp_params, broad_pp_tensor, group=mpu.get_expert_tensor_parallel_group())
+                    infer_params = etp_params
                 else:
-                    params = [param]
+                    infer_params = [broad_pp_tensor]
 
                 merge_params = default_tp_concat_fn(
                     layer_name_mapping,
-                    name,
+                    cur_name,
                     broad_pp_tensor,
-                    params,
+                    infer_params,  # 使用ETP all-gather后的参数
                     model_config,
                     weight_converter.hf_config,
                     convert_qkv_gate_up_by_simple_split,
+                    uniform_gather=True if is_bailing_moe_arc else False
                 )
                 if not isinstance(merge_params, list):
                     merge_params = [merge_params]
-                converted_names, converted_params = weight_converter.convert_param(name, merge_params)
-
+                converted_names, converted_params = weight_converter.convert_param(cur_name, merge_params)
                 yield from zip(converted_names, [param.detach() for param in converted_params], strict=True)
+            else:
+                # 传统MoE格式：decoder.layers.X.mlp.experts.linear_fcX.weightY
+                name_prefix, local_expert_id = cur_name.split(".weight")
+                local_expert_id = int(local_expert_id)
+                global_expert_ids = [num_experts_per_rank * ep_rank + local_expert_id for ep_rank in range(ep_size)]
+                global_expert_names = [f"{name_prefix}.weight{expert_id}" for expert_id in global_expert_ids]
+
+                for name, param in zip(global_expert_names, infer_params, strict=True):
+                    if etp_size > 1:
+                        # gather etp
+                        etp_params = [torch.empty_like(param) for _ in range(etp_size)]
+                        torch.distributed.all_gather(etp_params, param, group=etp_group)
+                        params = etp_params
+                    else:
+                        params = [param]
+
+                    merge_params = default_tp_concat_fn(
+                        layer_name_mapping,
+                        name,
+                        broad_pp_tensor,
+                        params,
+                        model_config,
+                        weight_converter.hf_config,
+                        convert_qkv_gate_up_by_simple_split,
+                    )
+                    if not isinstance(merge_params, list):
+                        merge_params = [merge_params]
+                    converted_names, converted_params = weight_converter.convert_param(name, merge_params)
+
+                    yield from zip(converted_names, [param.detach() for param in converted_params], strict=True)
             continue
 
         # tp all gather

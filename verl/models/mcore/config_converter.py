@@ -417,7 +417,7 @@ def hf_to_mcore_config_bailing_moe_v2(
         moe_shared_expert_intermediate_size=shared_intermediate_size * hf_config.num_shared_experts, # consistent with deepseekv3?
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
         moe_shared_expert_overlap=True,
-        moe_grouped_gemm=False,  # HF 侧独立 expert
+        moe_grouped_gemm=True,  # HF 侧独立 expert
         moe_router_score_function=hf_config.score_function,
         moe_router_load_balancing_type="none",
         # moe_aux_loss_coeff=getattr(hf_config, "router_aux_loss_coef", 0.001),
